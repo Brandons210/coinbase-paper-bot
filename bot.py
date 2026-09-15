@@ -242,19 +242,18 @@ def main():
     print("=== COINBASE BTC/ETH PAPER BOT ===")
     print("LIVE ORDER PLACEMENT: DISABLED")
     print(f"Starting simulated balance: ${config.STARTING_CASH:,.2f}")
+
     client = RESTClient()
     state = load_state()
 
-    while True:
-        try:
-            run_once(client, state)
-        except KeyboardInterrupt:
-            save_state(state)
-            print("\nStopped.")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-        time.sleep(config.POLL_SECONDS)
+    try:
+        run_once(client, state)
+        save_state(state)
+        print("Paper check complete. State saved.")
+    except Exception as e:
+        save_state(state)
+        print(f"Error: {e}")
+        raise
 
 
 if __name__ == "__main__":
