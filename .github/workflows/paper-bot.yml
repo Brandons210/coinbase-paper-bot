@@ -1,0 +1,41 @@
+name: Coinbase Paper Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coinbase-paper-bot
+  cancel-in-progress: false
+
+jobs:
+  paper-trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Get bot files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Coinbase library
+        run: pip install -r requirements.txt
+
+      - name: Run paper bot
+        run: timeout 75s python -u bot.py || true
+
+      - name: Save paper trading results
+        run: |
+          git config user.name "paper-bot"
+          git config user.email "paper-bot@users.noreply.github.com"
+          git add paper_state.json trades.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update paper trading results"
+          git push
