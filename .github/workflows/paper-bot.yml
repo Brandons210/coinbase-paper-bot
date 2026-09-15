@@ -29,8 +29,8 @@ jobs:
       - name: Install Coinbase library
         run: pip install -r requirements.txt
 
-      - name: Run paper bot
-        run: python -u bot.py
+      - name: Run backtest
+        run: python -u backtest.py
 
       - name: Save paper trading results
         run: |
