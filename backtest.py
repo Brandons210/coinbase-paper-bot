@@ -83,15 +83,15 @@ def get_history(client, product, days=DAYS_TO_TEST):
     start_time = end_time - timedelta(days=days)
 
     all_candles = {}
-
-    chunk_seconds = CANDLES_PER_REQUEST * GRANULARITY_SECONDS
+    batch_seconds = (CANDLES_PER_REQUEST - 1) * GRANULARITY_SECONDS
     cursor = start_time
+    batch_number = 0
 
     print(f"Downloading about {days} days of {product} candles...")
 
     while cursor < end_time:
         chunk_end = min(
-            cursor + timedelta(seconds=chunk_seconds),
+            cursor + timedelta(seconds=batch_seconds),
             end_time
         )
 
@@ -103,6 +103,12 @@ def get_history(client, product, days=DAYS_TO_TEST):
             limit=CANDLES_PER_REQUEST,
         )
 
+        batch_number += 1
+        print(
+            f"  Batch {batch_number}: "
+            f"{len(response.candles)} candles"
+        )
+
         for c in response.candles:
             candle = {
                 "time": int(c.start),
@@ -112,17 +118,15 @@ def get_history(client, product, days=DAYS_TO_TEST):
                 "close": float(c.close),
                 "volume": float(c.volume),
             }
-
             all_candles[candle["time"]] = candle
 
-        cursor = chunk_end
-
-        # Be polite to the public API.
-        time.sleep(0.15)
+        cursor = chunk_end + timedelta(seconds=GRANULARITY_SECONDS)
+        time.sleep(0.20)
 
     candles = list(all_candles.values())
     candles.sort(key=lambda x: x["time"])
 
+    print(f"Total unique candles downloaded: {len(candles)}")
     return candles
 
 
