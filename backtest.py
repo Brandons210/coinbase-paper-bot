@@ -4,19 +4,16 @@ import math
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
-from itertools import product
 
 import config
 
 
 # ============================================================
-# V5 — BREAKOUT / VOLATILITY EXPANSION
-# PAPER + BACKTEST ONLY
+# V5.1 — FIXED STRATEGY COST STRESS TEST
+# PAPER / BACKTEST ONLY
 # ============================================================
 
 DAYS_TO_TEST = 365
-
-# 1-hour execution candles
 GRANULARITY_SECONDS = 3600
 CANDLES_PER_REQUEST = 250
 
@@ -28,40 +25,69 @@ MAX_POSITION_PCT = 0.30
 ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 
-# 60 / 20 / 20 chronological split
-TRAIN_RATIO = 0.60
-VALIDATION_RATIO = 0.20
 
-MIN_TRAIN_TRADES = 8
-FINALISTS = 20
+# ============================================================
+# FREEZE THE V5 PARAMETERS
+# DO NOT OPTIMIZE THESE IN THIS TEST
+# ============================================================
+
+SETUPS = {
+    "BTC-USD": {
+        "breakout_lookback": 48,
+        "trend_period": 50,
+        "volume_mult": 1.2,
+        "atr_stop_mult": 2.0,
+        "atr_target_mult": 3.0,
+        "max_hold_bars": 24,
+    },
+
+    "ETH-USD": {
+        "breakout_lookback": 12,
+        "trend_period": 50,
+        "volume_mult": 1.2,
+        "atr_stop_mult": 2.0,
+        "atr_target_mult": 3.0,
+        "max_hold_bars": 24,
+    },
+}
 
 
 # ============================================================
-# IMPORTANT:
-# Stage 1 tests GROSS EDGE with ZERO fees.
+# COST SCENARIOS
 #
-# Only if a setup survives holdout gross-positive should we
-# move it into a separate realistic fee/slippage test.
+# Fee = per side
+# Slippage = adverse movement per side
+#
+# These are stress-test assumptions, not claims about what
+# your actual account will necessarily pay.
 # ============================================================
 
-FEE_RATE = 0.0
+COST_SCENARIOS = {
+    "ZERO COST": {
+        "fee": 0.0,
+        "slippage": 0.0,
+    },
 
+    "MAKER 0.40%": {
+        "fee": 0.004,
+        "slippage": 0.0,
+    },
 
-# ============================================================
-# PARAMETER GRID
-# ============================================================
+    "MAKER 0.40% + 0.05% SLIPPAGE": {
+        "fee": 0.004,
+        "slippage": 0.0005,
+    },
 
-BREAKOUT_LOOKBACKS = [12, 24, 48]
-TREND_EMAS = [50, 100]
+    "TAKER 0.60%": {
+        "fee": 0.006,
+        "slippage": 0.0,
+    },
 
-VOLUME_MULTS = [0.8, 1.0, 1.2]
-
-ATR_STOP_MULTS = [1.5, 2.0, 2.5]
-
-ATR_TARGET_MULTS = [3.0, 4.0, 6.0]
-
-# Exit if no target/stop after this many hours.
-MAX_HOLD_BARS = [24, 48, 72]
+    "TAKER 0.60% + 0.05% SLIPPAGE": {
+        "fee": 0.006,
+        "slippage": 0.0005,
+    },
+}
 
 
 # ============================================================
@@ -131,7 +157,7 @@ def atr(candles, period=14):
 
 
 # ============================================================
-# COINBASE DATA
+# COINBASE HISTORICAL DATA
 # ============================================================
 
 def iso_time(dt):
@@ -172,7 +198,7 @@ def get_history(product_name):
     print()
     print(
         f"Downloading {DAYS_TO_TEST} days "
-        f"of {product_name} 1H candles..."
+        f"of {product_name}..."
     )
 
     while cursor < end_time:
@@ -201,7 +227,7 @@ def get_history(product_name):
             url,
             headers={
                 "User-Agent":
-                    "coinbase-v5-backtest/1.0",
+                    "coinbase-v51-backtest/1.0",
                 "Accept":
                     "application/json",
             },
@@ -284,21 +310,39 @@ def get_history(product_name):
 
 
 # ============================================================
-# BACKTEST
+# FIXED STRATEGY BACKTEST
 # ============================================================
 
 def run_strategy(
     candles,
-    breakout_lookback,
-    trend_period,
-    volume_mult,
-    atr_stop_mult,
-    atr_target_mult,
-    max_hold_bars,
+    settings,
+    fee_rate,
+    slippage_rate,
 ):
 
-    if len(candles) < 300:
-        return None
+    breakout_lookback = (
+        settings["breakout_lookback"]
+    )
+
+    trend_period = (
+        settings["trend_period"]
+    )
+
+    volume_mult = (
+        settings["volume_mult"]
+    )
+
+    atr_stop_mult = (
+        settings["atr_stop_mult"]
+    )
+
+    atr_target_mult = (
+        settings["atr_target_mult"]
+    )
+
+    max_hold_bars = (
+        settings["max_hold_bars"]
+    )
 
     closes = [
         candle["close"]
@@ -340,13 +384,22 @@ def run_strategy(
 
         # ====================================================
         # NEXT-BAR ENTRY
+        #
+        # Long entry receives adverse slippage upward.
         # ====================================================
 
         if (
             pending_entry is not None
             and position is None
         ):
-            entry_price = candle["open"]
+            raw_entry_price = (
+                candle["open"]
+            )
+
+            entry_price = (
+                raw_entry_price
+                * (1.0 + slippage_rate)
+            )
 
             atr_at_signal = (
                 pending_entry["atr"]
@@ -392,8 +445,18 @@ def run_strategy(
                         qty * entry_price
                     )
 
-                    if entry_value <= cash:
-                        cash -= entry_value
+                    entry_fee = (
+                        entry_value
+                        * fee_rate
+                    )
+
+                    total_cost = (
+                        entry_value
+                        + entry_fee
+                    )
+
+                    if total_cost <= cash:
+                        cash -= total_cost
 
                         position = {
                             "entry":
@@ -401,6 +464,9 @@ def run_strategy(
 
                             "qty":
                                 qty,
+
+                            "entry_fee":
+                                entry_fee,
 
                             "stop":
                                 entry_price
@@ -433,19 +499,19 @@ def run_strategy(
                 >= position["target"]
             )
 
-            exit_price = None
+            raw_exit_price = None
             reason = None
 
-            # Conservative if both occur in same hourly bar.
+            # Conservative same-bar assumption.
             if stop_hit:
-                exit_price = (
+                raw_exit_price = (
                     position["stop"]
                 )
 
                 reason = "STOP"
 
             elif target_hit:
-                exit_price = (
+                raw_exit_price = (
                     position["target"]
                 )
 
@@ -455,16 +521,27 @@ def run_strategy(
                 position["bars_held"]
                 >= max_hold_bars
             ):
-                exit_price = (
+                raw_exit_price = (
                     candle["close"]
                 )
 
                 reason = "TIME"
 
-            if exit_price is not None:
+            if raw_exit_price is not None:
+                # Long exit receives adverse slippage downward.
+                exit_price = (
+                    raw_exit_price
+                    * (1.0 - slippage_rate)
+                )
+
                 exit_value = (
                     position["qty"]
                     * exit_price
+                )
+
+                exit_fee = (
+                    exit_value
+                    * fee_rate
                 )
 
                 gross_pnl = (
@@ -475,10 +552,25 @@ def run_strategy(
                     * position["qty"]
                 )
 
-                cash += exit_value
+                total_fees = (
+                    position["entry_fee"]
+                    + exit_fee
+                )
+
+                net_pnl = (
+                    gross_pnl
+                    - total_fees
+                )
+
+                cash += (
+                    exit_value
+                    - exit_fee
+                )
 
                 trades.append({
-                    "pnl": gross_pnl,
+                    "gross": gross_pnl,
+                    "fees": total_fees,
+                    "net": net_pnl,
                     "reason": reason,
                 })
 
@@ -493,7 +585,9 @@ def run_strategy(
             and pending_entry is None
             and i < len(candles) - 1
         ):
-            price = candle["close"]
+            price = (
+                candle["close"]
+            )
 
             current_atr = (
                 atr_values[i]
@@ -505,8 +599,6 @@ def run_strategy(
             ):
                 continue
 
-            # Highest HIGH of PREVIOUS candles.
-            # Current candle is deliberately excluded.
             prior_high = max(
                 candles[j]["high"]
                 for j in range(
@@ -528,30 +620,15 @@ def run_strategy(
                 / len(volume_window)
             )
 
-            # ----------------------------------------------
-            # HIGHER-TIMEFRAME-LIKE REGIME
-            #
-            # We're using a much slower hourly EMA as a
-            # regime filter instead of another crossover.
-            # ----------------------------------------------
-
             trend_ok = (
                 price > trend[i]
                 and
                 trend[i] > trend[i - 6]
             )
 
-            # ----------------------------------------------
-            # TRUE BREAKOUT
-            # ----------------------------------------------
-
             breakout_ok = (
                 price > prior_high
             )
-
-            # ----------------------------------------------
-            # VOLUME EXPANSION
-            # ----------------------------------------------
 
             volume_ok = (
                 candle["volume"]
@@ -559,14 +636,9 @@ def run_strategy(
                 * volume_mult
             )
 
-            # ----------------------------------------------
-            # VOLATILITY FILTER
-            #
-            # Avoid extremely dead conditions.
-            # ----------------------------------------------
-
             atr_pct = (
-                current_atr / price
+                current_atr
+                / price
             )
 
             volatility_ok = (
@@ -615,32 +687,64 @@ def run_strategy(
             )
 
     # ========================================================
-    # CLOSE AT END OF TEST WINDOW
+    # CLOSE FINAL POSITION
     # ========================================================
 
     if position is not None:
-        final_price = (
+        raw_exit_price = (
             candles[-1]["close"]
+        )
+
+        exit_price = (
+            raw_exit_price
+            * (1.0 - slippage_rate)
         )
 
         exit_value = (
             position["qty"]
-            * final_price
+            * exit_price
         )
 
-        pnl = (
+        exit_fee = (
+            exit_value
+            * fee_rate
+        )
+
+        gross_pnl = (
             (
-                final_price
+                exit_price
                 - position["entry"]
             )
             * position["qty"]
         )
 
-        cash += exit_value
+        total_fees = (
+            position["entry_fee"]
+            + exit_fee
+        )
+
+        net_pnl = (
+            gross_pnl
+            - total_fees
+        )
+
+        cash += (
+            exit_value
+            - exit_fee
+        )
 
         trades.append({
-            "pnl": pnl,
-            "reason": "END",
+            "gross":
+                gross_pnl,
+
+            "fees":
+                total_fees,
+
+            "net":
+                net_pnl,
+
+            "reason":
+                "END",
         })
 
     return calculate_results(
@@ -660,24 +764,36 @@ def calculate_results(
 
     count = len(trades)
 
-    total_pnl = sum(
-        trade["pnl"]
+    total_gross = sum(
+        trade["gross"]
+        for trade in trades
+    )
+
+    total_fees = sum(
+        trade["fees"]
+        for trade in trades
+    )
+
+    total_net = sum(
+        trade["net"]
         for trade in trades
     )
 
     winners = [
-        trade["pnl"]
+        trade["net"]
         for trade in trades
-        if trade["pnl"] > 0
+        if trade["net"] > 0
     ]
 
     losers = [
-        trade["pnl"]
+        trade["net"]
         for trade in trades
-        if trade["pnl"] <= 0
+        if trade["net"] <= 0
     ]
 
-    gross_profit = sum(winners)
+    gross_profit = sum(
+        winners
+    )
 
     gross_loss = abs(
         sum(losers)
@@ -690,7 +806,9 @@ def calculate_results(
         )
 
     elif gross_profit > 0:
-        profit_factor = math.inf
+        profit_factor = (
+            math.inf
+        )
 
     else:
         profit_factor = 0.0
@@ -718,7 +836,14 @@ def calculate_results(
     )
 
     expectancy = (
-        total_pnl
+        total_net
+        / count
+        if count
+        else 0.0
+    )
+
+    avg_fee = (
+        total_fees
         / count
         if count
         else 0.0
@@ -743,16 +868,23 @@ def calculate_results(
     )
 
     return {
-        "trades": count,
+        "trades":
+            count,
 
         "win_rate":
             win_rate,
 
-        "pnl":
-            total_pnl,
+        "gross":
+            total_gross,
+
+        "fees":
+            total_fees,
+
+        "net":
+            total_net,
 
         "return_pct":
-            total_pnl
+            total_net
             / STARTING_CASH
             * 100.0,
 
@@ -772,6 +904,9 @@ def calculate_results(
         "expectancy":
             expectancy,
 
+        "avg_fee":
+            avg_fee,
+
         "targets":
             targets,
 
@@ -781,20 +916,6 @@ def calculate_results(
         "time_exits":
             time_exits,
     }
-
-
-# ============================================================
-# SCORING
-# ============================================================
-
-def score(result):
-    if result["trades"] == 0:
-        return -999999.0
-
-    return (
-        result["return_pct"]
-        - result["drawdown"] * 0.50
-    )
 
 
 # ============================================================
@@ -809,69 +930,98 @@ def pf_text(value):
 
 
 def print_result(
-    label,
+    scenario_name,
     result,
 ):
 
+    print()
+    print("-" * 78)
+
     print(
-        f"{label} -> "
-        f"{result['return_pct']:+.2f}% | "
-        f"{result['trades']} trades | "
-        f"{result['win_rate']:.1f}% win | "
-        f"DD {result['drawdown']:.2f}% | "
-        f"PF {pf_text(result['profit_factor'])} | "
-        f"Expect ${result['expectancy']:+.2f}"
+        scenario_name
+    )
+
+    print("-" * 78)
+
+    print(
+        f"Return: "
+        f"{result['return_pct']:+.2f}%"
+    )
+
+    print(
+        f"Trades: "
+        f"{result['trades']}"
+    )
+
+    print(
+        f"Win rate: "
+        f"{result['win_rate']:.1f}%"
+    )
+
+    print(
+        f"Gross P/L: "
+        f"${result['gross']:+.2f}"
+    )
+
+    print(
+        f"Fees: "
+        f"${result['fees']:.2f}"
+    )
+
+    print(
+        f"Net P/L: "
+        f"${result['net']:+.2f}"
+    )
+
+    print(
+        f"Average fee/trade: "
+        f"${result['avg_fee']:.2f}"
+    )
+
+    print(
+        f"Average winner: "
+        f"${result['avg_winner']:+.2f}"
+    )
+
+    print(
+        f"Average loser: "
+        f"${result['avg_loser']:+.2f}"
+    )
+
+    print(
+        f"Expectancy/trade: "
+        f"${result['expectancy']:+.2f}"
+    )
+
+    print(
+        f"Profit factor: "
+        f"{pf_text(result['profit_factor'])}"
+    )
+
+    print(
+        f"Max drawdown: "
+        f"{result['drawdown']:.2f}%"
+    )
+
+    print(
+        f"Exits -> "
+        f"Targets {result['targets']} | "
+        f"Stops {result['stops']} | "
+        f"Time {result['time_exits']}"
     )
 
 
 # ============================================================
-# TRAIN -> VALIDATE -> HOLDOUT
+# PRODUCT TEST
 # ============================================================
 
-def optimize(
+def test_product(
     product_name,
     candles,
 ):
 
-    train_end = int(
-        len(candles)
-        * TRAIN_RATIO
-    )
-
-    validation_end = int(
-        len(candles)
-        * (
-            TRAIN_RATIO
-            + VALIDATION_RATIO
-        )
-    )
-
-    training = (
-        candles[:train_end]
-    )
-
-    validation = (
-        candles[
-            train_end:
-            validation_end
-        ]
-    )
-
-    holdout = (
-        candles[
-            validation_end:
-        ]
-    )
-
-    combinations = list(
-        product(
-            BREAKOUT_LOOKBACKS,
-            TREND_EMAS,
-            VOLUME_MULTS,
-            ATR_STOP_MULTS,
-            ATR_TARGET_MULTS,
-            MAX_HOLD_BARS,
-        )
+    settings = (
+        SETUPS[product_name]
     )
 
     print()
@@ -879,265 +1029,96 @@ def optimize(
 
     print(
         f"{product_name} | "
-        f"V5 GROSS-EDGE TEST"
+        f"V5.1 FIXED COST STRESS TEST"
     )
 
     print("=" * 78)
 
     print(
-        f"Training candles: "
-        f"{len(training)}"
+        "NO PARAMETER OPTIMIZATION"
     )
 
     print(
-        f"Validation candles: "
-        f"{len(validation)}"
-    )
-
-    print(
-        f"Holdout candles: "
-        f"{len(holdout)}"
-    )
-
-    print(
-        f"Combinations: "
-        f"{len(combinations)}"
-    )
-
-    print(
-        "Fees: $0.00 for Stage 1"
-    )
-
-    # ========================================================
-    # TRAIN
-    # ========================================================
-
-    trained = []
-
-    for combo in combinations:
-        result = run_strategy(
-            training,
-            *combo,
-        )
-
-        if (
-            result is not None
-            and result["trades"]
-            >= MIN_TRAIN_TRADES
-        ):
-            trained.append({
-                "settings":
-                    combo,
-
-                "train":
-                    result,
-            })
-
-    if not trained:
-        print(
-            "No strategies produced "
-            "enough training trades."
-        )
-
-        return
-
-    trained.sort(
-        key=lambda item:
-            score(item["train"]),
-        reverse=True,
-    )
-
-    # ========================================================
-    # VALIDATION
-    # ========================================================
-
-    validated = []
-
-    for candidate in trained[
-        :FINALISTS
-    ]:
-
-        result = run_strategy(
-            validation,
-            *candidate["settings"],
-        )
-
-        if (
-            result is None
-            or result["trades"] < 3
-        ):
-            continue
-
-        validated.append({
-            "settings":
-                candidate["settings"],
-
-            "train":
-                candidate["train"],
-
-            "validation":
-                result,
-        })
-
-    if not validated:
-        print(
-            "No finalists produced enough "
-            "validation trades."
-        )
-
-        return
-
-    validated.sort(
-        key=lambda item:
-            score(
-                item["validation"]
-            ),
-        reverse=True,
-    )
-
-    selected = validated[0]
-
-    # ========================================================
-    # UNTOUCHED HOLDOUT
-    # ========================================================
-
-    final = run_strategy(
-        holdout,
-        *selected["settings"],
-    )
-
-    (
-        breakout_lookback,
-        trend_period,
-        volume_mult,
-        atr_stop,
-        atr_target,
-        max_hold,
-    ) = selected["settings"]
-
-    train = selected["train"]
-    valid = selected["validation"]
-
-    print()
-    print(
-        "SELECTED BEFORE HOLDOUT"
-    )
-
-    print("-" * 78)
-
-    print(
-        f"Breakout lookback: "
-        f"{breakout_lookback} hours"
+        f"Breakout: "
+        f"{settings['breakout_lookback']}H"
     )
 
     print(
         f"Trend EMA: "
-        f"{trend_period}"
+        f"{settings['trend_period']}"
     )
 
     print(
         f"Volume: "
-        f"{volume_mult}x average"
+        f"{settings['volume_mult']}x"
     )
 
     print(
         f"ATR stop/target: "
-        f"{atr_stop}x / "
-        f"{atr_target}x"
+        f"{settings['atr_stop_mult']}x / "
+        f"{settings['atr_target_mult']}x"
     )
 
     print(
-        f"Maximum hold: "
-        f"{max_hold} hours"
+        f"Max hold: "
+        f"{settings['max_hold_bars']}H"
     )
+
+    results = {}
+
+    for (
+        scenario_name,
+        costs,
+    ) in COST_SCENARIOS.items():
+
+        result = run_strategy(
+            candles,
+            settings,
+            costs["fee"],
+            costs["slippage"],
+        )
+
+        results[
+            scenario_name
+        ] = result
+
+        print_result(
+            scenario_name,
+            result,
+        )
 
     print()
-
-    print_result(
-        "TRAIN",
-        train,
-    )
-
-    print_result(
-        "VALID",
-        valid,
-    )
-
-    print()
     print("=" * 78)
 
     print(
-        "UNTOUCHED HOLDOUT — GROSS EDGE"
+        f"{product_name} COST SURVIVAL SUMMARY"
     )
 
     print("=" * 78)
 
-    print_result(
-        "HOLDOUT",
-        final,
-    )
+    for (
+        scenario_name,
+        result,
+    ) in results.items():
 
-    print(
-        f"Gross P/L: "
-        f"${final['pnl']:+.2f}"
-    )
+        if (
+            result["net"] > 0
+            and
+            result["profit_factor"] > 1.0
+            and
+            result["expectancy"] > 0
+        ):
+            status = "PASS"
 
-    print(
-        f"Average winner: "
-        f"${final['avg_winner']:+.2f}"
-    )
-
-    print(
-        f"Average loser: "
-        f"${final['avg_loser']:+.2f}"
-    )
-
-    print(
-        f"Expectancy/trade: "
-        f"${final['expectancy']:+.2f}"
-    )
-
-    print(
-        f"Profit factor: "
-        f"{pf_text(final['profit_factor'])}"
-    )
-
-    print(
-        f"Exits -> "
-        f"Targets {final['targets']} | "
-        f"Stops {final['stops']} | "
-        f"Time {final['time_exits']}"
-    )
-
-    print("=" * 78)
-
-    # ========================================================
-    # SIMPLE PASS / FAIL
-    # ========================================================
-
-    if (
-        final["trades"] >= 5
-        and final["pnl"] > 0
-        and final["profit_factor"] > 1.0
-        and final["expectancy"] > 0
-    ):
-        print(
-            "V5 STAGE 1: GROSS EDGE DETECTED"
-        )
+        else:
+            status = "FAIL"
 
         print(
-            "Next step: realistic "
-            "fees + slippage test."
-        )
-
-    else:
-        print(
-            "V5 STAGE 1: NO ROBUST "
-            "GROSS EDGE DETECTED"
-        )
-
-        print(
-            "Do NOT increase risk."
+            f"{scenario_name}: "
+            f"{status} | "
+            f"Net ${result['net']:+.2f} | "
+            f"PF {pf_text(result['profit_factor'])} | "
+            f"Expect ${result['expectancy']:+.2f}"
         )
 
 
@@ -1148,11 +1129,11 @@ def optimize(
 def main():
 
     print(
-        "BTC/ETH STRATEGY V5"
+        "BTC/ETH STRATEGY V5.1"
     )
 
     print(
-        "BREAKOUT / VOLATILITY EXPANSION"
+        "FIXED BREAKOUT COST STRESS TEST"
     )
 
     print(
@@ -1169,14 +1150,7 @@ def main():
     )
 
     print(
-        "60% TRAIN / "
-        "20% VALIDATION / "
-        "20% UNTOUCHED HOLDOUT"
-    )
-
-    print(
-        "STAGE 1 = ZERO-FEE "
-        "GROSS EDGE TEST"
+        "V5 PARAMETERS ARE FROZEN"
     )
 
     print(
@@ -1184,14 +1158,17 @@ def main():
         f"{RISK_PER_TRADE * 100:.1f}%"
     )
 
-    for product_name in config.PRODUCTS:
+    for product_name in [
+        "BTC-USD",
+        "ETH-USD",
+    ]:
 
         try:
             candles = get_history(
                 product_name
             )
 
-            optimize(
+            test_product(
                 product_name,
                 candles,
             )
