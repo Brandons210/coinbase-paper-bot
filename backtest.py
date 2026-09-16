@@ -12,7 +12,10 @@ from datetime import datetime, timezone, timedelta
 # ============================================================
 
 DAYS_TO_TEST = 730
-GRANULARITY_SECONDS = 14400  # 4 hours
+
+# Coinbase supports 1H candles.
+# We download 1H and combine them into 4H candles ourselves.
+DOWNLOAD_GRANULARITY_SECONDS = 3600
 CANDLES_PER_REQUEST = 250
 
 STARTING_CASH = 10000.0
@@ -23,13 +26,17 @@ MAX_POSITION_PCT = 0.30
 ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 
-PRODUCTS = ["BTC-USD", "ETH-USD"]
+PRODUCTS = [
+    "BTC-USD",
+    "ETH-USD",
+]
 
 
 # ============================================================
 # COST SCENARIOS
 #
-# These remain TEST assumptions, not confirmed account fees.
+# These are stress-test assumptions.
+# They are NOT confirmation of your actual Coinbase fee tier.
 # ============================================================
 
 COST_SCENARIOS = {
@@ -63,7 +70,7 @@ COST_SCENARIOS = {
 # ============================================================
 # SMALL FIXED STRATEGY SET
 #
-# No giant optimization grid.
+# No giant optimizer.
 # ============================================================
 
 STRATEGIES = [
@@ -79,7 +86,7 @@ STRATEGIES = [
 
     {
         "name": "BREAKOUT-5D",
-        "breakout": 30,       # 5 days
+        "breakout": 30,       # 30 x 4H = 5 days
         "trend_ema": 75,
         "volume_mult": 1.0,
         "stop_atr": 3.0,
@@ -89,7 +96,7 @@ STRATEGIES = [
 
     {
         "name": "BREAKOUT-7D",
-        "breakout": 42,       # 7 days
+        "breakout": 42,       # 42 x 4H = 7 days
         "trend_ema": 100,
         "volume_mult": 0.9,
         "stop_atr": 3.0,
@@ -109,8 +116,8 @@ def ema(values, period):
 
     k = 2.0 / (period + 1)
 
-    result = [values[0]]
     current = values[0]
+    result = [current]
 
     for value in values[1:]:
         current = (
@@ -125,14 +132,17 @@ def ema(values, period):
 
 def atr(candles, period):
     result = [0.0] * len(candles)
-    trs = [0.0] * len(candles)
+    true_ranges = [0.0] * len(candles)
 
     for i in range(1, len(candles)):
         high = candles[i]["high"]
         low = candles[i]["low"]
-        previous_close = candles[i - 1]["close"]
 
-        trs[i] = max(
+        previous_close = (
+            candles[i - 1]["close"]
+        )
+
+        true_ranges[i] = max(
             high - low,
             abs(high - previous_close),
             abs(low - previous_close),
@@ -142,16 +152,19 @@ def atr(candles, period):
         return result
 
     current = (
-        sum(trs[1:period + 1])
+        sum(true_ranges[1:period + 1])
         / period
     )
 
     result[period] = current
 
-    for i in range(period + 1, len(candles)):
+    for i in range(
+        period + 1,
+        len(candles)
+    ):
         current = (
             current * (period - 1)
-            + trs[i]
+            + true_ranges[i]
         ) / period
 
         result[i] = current
@@ -160,28 +173,124 @@ def atr(candles, period):
 
 
 # ============================================================
-# DATA DOWNLOAD
+# TIME
 # ============================================================
 
 def iso_time(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
+
+# ============================================================
+# 1H -> 4H CONVERSION
+#
+# We align bars to UTC 00:00, 04:00, 08:00, etc.
+# This is safer than blindly grouping every four downloaded
+# candles from an arbitrary starting timestamp.
+# ============================================================
+
+def convert_to_4h(hourly):
+    if not hourly:
+        return []
+
+    hourly = sorted(
+        hourly,
+        key=lambda x: x["time"]
+    )
+
+    groups = {}
+
+    four_hours = 4 * 3600
+
+    for candle in hourly:
+        bucket_time = (
+            candle["time"]
+            // four_hours
+            * four_hours
+        )
+
+        if bucket_time not in groups:
+            groups[bucket_time] = []
+
+        groups[bucket_time].append(candle)
+
+    four_hour = []
+
+    for bucket_time in sorted(groups):
+        group = sorted(
+            groups[bucket_time],
+            key=lambda x: x["time"]
+        )
+
+        # Require exactly four hourly candles.
+        if len(group) != 4:
+            continue
+
+        expected_times = [
+            bucket_time,
+            bucket_time + 3600,
+            bucket_time + 7200,
+            bucket_time + 10800,
+        ]
+
+        actual_times = [
+            x["time"]
+            for x in group
+        ]
+
+        if actual_times != expected_times:
+            continue
+
+        four_hour.append({
+            "time": bucket_time,
+            "open": group[0]["open"],
+            "high": max(
+                x["high"]
+                for x in group
+            ),
+            "low": min(
+                x["low"]
+                for x in group
+            ),
+            "close": group[-1]["close"],
+            "volume": sum(
+                x["volume"]
+                for x in group
+            ),
+        })
+
+    return four_hour
+
+
+# ============================================================
+# DOWNLOAD COINBASE 1H DATA
+# ============================================================
 
 def download_history(product):
     now = datetime.now(timezone.utc)
 
-    end_timestamp = (
+    # Last completed hourly candle.
+    current_hour = (
         int(now.timestamp())
-        // GRANULARITY_SECONDS
-        * GRANULARITY_SECONDS
+        // DOWNLOAD_GRANULARITY_SECONDS
+        * DOWNLOAD_GRANULARITY_SECONDS
+    )
+
+    end_timestamp = (
+        current_hour
+        - DOWNLOAD_GRANULARITY_SECONDS
     )
 
     end = datetime.fromtimestamp(
-        end_timestamp - GRANULARITY_SECONDS,
+        end_timestamp,
         timezone.utc,
     )
 
-    start = end - timedelta(days=DAYS_TO_TEST)
+    start = (
+        end
+        - timedelta(days=DAYS_TO_TEST)
+    )
 
     candles_by_time = {}
 
@@ -190,25 +299,29 @@ def download_history(product):
 
     chunk_seconds = (
         CANDLES_PER_REQUEST
-        * GRANULARITY_SECONDS
+        * DOWNLOAD_GRANULARITY_SECONDS
     )
 
     print()
     print(
         f"Downloading {DAYS_TO_TEST} days "
-        f"of {product} 4H candles..."
+        f"of {product} 1H candles..."
     )
 
     while cursor < end:
         chunk_end = min(
-            cursor + timedelta(seconds=chunk_seconds),
+            cursor
+            + timedelta(
+                seconds=chunk_seconds
+            ),
             end,
         )
 
         params = urllib.parse.urlencode({
             "start": iso_time(cursor),
             "end": iso_time(chunk_end),
-            "granularity": GRANULARITY_SECONDS,
+            "granularity":
+                DOWNLOAD_GRANULARITY_SECONDS,
         })
 
         url = (
@@ -220,31 +333,47 @@ def download_history(product):
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "coinbase-v6-backtest/1.0",
-                "Accept": "application/json",
+                "User-Agent":
+                    "coinbase-v6-backtest/1.1",
+                "Accept":
+                    "application/json",
             },
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
 
-            data = json.loads(
-                response.read().decode("utf-8")
+                data = json.loads(
+                    response
+                    .read()
+                    .decode("utf-8")
+                )
+
+        except Exception as exc:
+            print(
+                f"Download error around "
+                f"{cursor}: {exc}"
             )
+
+            raise
 
         if not isinstance(data, list):
             raise RuntimeError(
-                f"Unexpected Coinbase response: {data}"
+                f"Unexpected Coinbase response: "
+                f"{data}"
             )
 
         for c in data:
             if len(c) < 6:
                 continue
 
-            candles_by_time[int(c[0])] = {
-                "time": int(c[0]),
+            timestamp = int(c[0])
+
+            candles_by_time[timestamp] = {
+                "time": timestamp,
                 "low": float(c[1]),
                 "high": float(c[2]),
                 "open": float(c[3]),
@@ -255,16 +384,56 @@ def download_history(product):
         batches += 1
 
         if batches % 5 == 0:
-            print(f"Downloaded {batches} batches...")
+            print(
+                f"Downloaded "
+                f"{batches} batches..."
+            )
 
         cursor = chunk_end
 
         time.sleep(0.20)
 
-    candles = list(candles_by_time.values())
-    candles.sort(key=lambda x: x["time"])
+    hourly = list(
+        candles_by_time.values()
+    )
 
-    print(f"Total candles: {len(candles)}")
+    hourly.sort(
+        key=lambda x: x["time"]
+    )
+
+    print(
+        f"Downloaded hourly candles: "
+        f"{len(hourly)}"
+    )
+
+    if hourly:
+        first_hour = datetime.fromtimestamp(
+            hourly[0]["time"],
+            timezone.utc,
+        )
+
+        last_hour = datetime.fromtimestamp(
+            hourly[-1]["time"],
+            timezone.utc,
+        )
+
+        print(
+            f"1H range: "
+            f"{first_hour} -> {last_hour}"
+        )
+
+    print(
+        "Building 4H candles..."
+    )
+
+    candles = convert_to_4h(
+        hourly
+    )
+
+    print(
+        f"Total 4H candles: "
+        f"{len(candles)}"
+    )
 
     if candles:
         first = datetime.fromtimestamp(
@@ -277,7 +446,15 @@ def download_history(product):
             timezone.utc,
         )
 
-        print(f"Range: {first} -> {last}")
+        print(
+            f"4H range: "
+            f"{first} -> {last}"
+        )
+
+    if len(candles) < 500:
+        raise RuntimeError(
+            "Not enough 4H candles were created."
+        )
 
     return candles
 
@@ -293,7 +470,10 @@ def backtest(
     slippage_rate,
 ):
 
-    closes = [x["close"] for x in candles]
+    closes = [
+        x["close"]
+        for x in candles
+    ]
 
     trend = ema(
         closes,
@@ -306,6 +486,7 @@ def backtest(
     )
 
     cash = STARTING_CASH
+
     position = None
     pending = None
 
@@ -321,21 +502,33 @@ def backtest(
         ATR_PERIOD + 5,
     )
 
-    for i in range(start_index, len(candles)):
+    for i in range(
+        start_index,
+        len(candles)
+    ):
         candle = candles[i]
 
         # ====================================================
-        # ENTER NEXT CANDLE OPEN
+        # NEXT-CANDLE ENTRY
         # ====================================================
 
-        if pending is not None and position is None:
-            raw_entry = candle["open"]
-
-            entry = raw_entry * (
-                1.0 + slippage_rate
+        if (
+            pending is not None
+            and position is None
+        ):
+            raw_entry = (
+                candle["open"]
             )
 
-            atr_signal = pending["atr"]
+            # Adverse slippage for a long entry.
+            entry = (
+                raw_entry
+                * (1.0 + slippage_rate)
+            )
+
+            atr_signal = (
+                pending["atr"]
+            )
 
             stop_distance = (
                 atr_signal
@@ -347,49 +540,73 @@ def backtest(
                 * strategy["target_atr"]
             )
 
-            risk_cash = (
-                cash * RISK_PER_TRADE
-            )
-
-            qty_risk = (
-                risk_cash / stop_distance
-                if stop_distance > 0
-                else 0.0
-            )
-
-            qty_cap = (
-                cash
-                * MAX_POSITION_PCT
-                / entry
-            )
-
-            qty = min(
-                qty_risk,
-                qty_cap,
-            )
-
-            entry_value = qty * entry
-            entry_fee = entry_value * fee_rate
-
             if (
-                qty > 0
-                and entry_value + entry_fee <= cash
+                entry > 0
+                and stop_distance > 0
             ):
-                cash -= (
+                risk_cash = (
+                    cash
+                    * RISK_PER_TRADE
+                )
+
+                qty_risk = (
+                    risk_cash
+                    / stop_distance
+                )
+
+                qty_cap = (
+                    cash
+                    * MAX_POSITION_PCT
+                    / entry
+                )
+
+                qty = min(
+                    qty_risk,
+                    qty_cap,
+                )
+
+                entry_value = (
+                    qty * entry
+                )
+
+                entry_fee = (
+                    entry_value
+                    * fee_rate
+                )
+
+                total_entry_cost = (
                     entry_value
                     + entry_fee
                 )
 
-                position = {
-                    "entry": entry,
-                    "qty": qty,
-                    "entry_fee": entry_fee,
-                    "stop":
-                        entry - stop_distance,
-                    "target":
-                        entry + target_distance,
-                    "bars": 0,
-                }
+                if (
+                    qty > 0
+                    and
+                    total_entry_cost <= cash
+                ):
+                    cash -= total_entry_cost
+
+                    position = {
+                        "entry":
+                            entry,
+
+                        "qty":
+                            qty,
+
+                        "entry_fee":
+                            entry_fee,
+
+                        "stop":
+                            entry
+                            - stop_distance,
+
+                        "target":
+                            entry
+                            + target_distance,
+
+                        "bars":
+                            0,
+                    }
 
             pending = None
 
@@ -413,23 +630,33 @@ def backtest(
             raw_exit = None
             reason = None
 
-            # Conservative ordering.
+            # Conservative same-bar assumption.
             if stop_hit:
-                raw_exit = position["stop"]
+                raw_exit = (
+                    position["stop"]
+                )
+
                 reason = "STOP"
 
             elif target_hit:
-                raw_exit = position["target"]
+                raw_exit = (
+                    position["target"]
+                )
+
                 reason = "TARGET"
 
             elif (
                 position["bars"]
                 >= strategy["max_hold"]
             ):
-                raw_exit = candle["close"]
+                raw_exit = (
+                    candle["close"]
+                )
+
                 reason = "TIME"
 
             if raw_exit is not None:
+                # Adverse slippage for long exit.
                 exit_price = (
                     raw_exit
                     * (1.0 - slippage_rate)
@@ -445,7 +672,7 @@ def backtest(
                     * fee_rate
                 )
 
-                price_pnl = (
+                gross_pnl = (
                     (
                         exit_price
                         - position["entry"]
@@ -453,12 +680,15 @@ def backtest(
                     * position["qty"]
                 )
 
-                fees = (
+                total_fees = (
                     position["entry_fee"]
                     + exit_fee
                 )
 
-                net = price_pnl - fees
+                net_pnl = (
+                    gross_pnl
+                    - total_fees
+                )
 
                 cash += (
                     exit_value
@@ -466,16 +696,23 @@ def backtest(
                 )
 
                 trades.append({
-                    "gross": price_pnl,
-                    "fees": fees,
-                    "net": net,
-                    "reason": reason,
+                    "gross":
+                        gross_pnl,
+
+                    "fees":
+                        total_fees,
+
+                    "net":
+                        net_pnl,
+
+                    "reason":
+                        reason,
                 })
 
                 position = None
 
         # ====================================================
-        # SIGNAL
+        # BREAKOUT SIGNAL
         # ====================================================
 
         if (
@@ -483,10 +720,18 @@ def backtest(
             and pending is None
             and i < len(candles) - 1
         ):
-            price = candle["close"]
-            current_atr = atr_values[i]
+            price = (
+                candle["close"]
+            )
 
-            if current_atr <= 0:
+            current_atr = (
+                atr_values[i]
+            )
+
+            if (
+                price <= 0
+                or current_atr <= 0
+            ):
                 continue
 
             prior_high = max(
@@ -508,14 +753,15 @@ def backtest(
                 / VOLUME_LOOKBACK
             )
 
-            # Bullish regime.
+            # Bullish market regime.
             trend_ok = (
                 price > trend[i]
                 and
                 trend[i] > trend[i - 3]
             )
 
-            # Actual breakout above previous range.
+            # Current close must actually break
+            # above the previous range.
             breakout_ok = (
                 price > prior_high
             )
@@ -526,25 +772,34 @@ def backtest(
                 * strategy["volume_mult"]
             )
 
-            # Require meaningful volatility.
-            atr_pct = current_atr / price
+            # Require meaningful 4H volatility.
+            atr_pct = (
+                current_atr
+                / price
+            )
 
             volatility_ok = (
                 atr_pct >= 0.005
             )
 
-            if (
+            signal = (
                 trend_ok
-                and breakout_ok
-                and volume_ok
-                and volatility_ok
-            ):
+                and
+                breakout_ok
+                and
+                volume_ok
+                and
+                volatility_ok
+            )
+
+            if signal:
                 pending = {
-                    "atr": current_atr
+                    "atr":
+                        current_atr
                 }
 
         # ====================================================
-        # EQUITY
+        # EQUITY / DRAWDOWN
         # ====================================================
 
         equity = cash
@@ -561,21 +816,24 @@ def backtest(
         )
 
         if peak_equity > 0:
-            dd = (
-                peak_equity - equity
+            drawdown = (
+                peak_equity
+                - equity
             ) / peak_equity
 
             max_drawdown = max(
                 max_drawdown,
-                dd,
+                drawdown,
             )
 
     # ========================================================
-    # CLOSE AT END
+    # CLOSE OPEN POSITION AT END
     # ========================================================
 
     if position is not None:
-        raw_exit = candles[-1]["close"]
+        raw_exit = (
+            candles[-1]["close"]
+        )
 
         exit_price = (
             raw_exit
@@ -592,7 +850,7 @@ def backtest(
             * fee_rate
         )
 
-        price_pnl = (
+        gross_pnl = (
             (
                 exit_price
                 - position["entry"]
@@ -600,12 +858,15 @@ def backtest(
             * position["qty"]
         )
 
-        fees = (
+        total_fees = (
             position["entry_fee"]
             + exit_fee
         )
 
-        net = price_pnl - fees
+        net_pnl = (
+            gross_pnl
+            - total_fees
+        )
 
         cash += (
             exit_value
@@ -613,61 +874,87 @@ def backtest(
         )
 
         trades.append({
-            "gross": price_pnl,
-            "fees": fees,
-            "net": net,
-            "reason": "END",
+            "gross":
+                gross_pnl,
+
+            "fees":
+                total_fees,
+
+            "net":
+                net_pnl,
+
+            "reason":
+                "END",
         })
 
-    return stats(
+    return calculate_stats(
         trades,
         max_drawdown,
     )
 
 
 # ============================================================
-# STATS
+# STATISTICS
 # ============================================================
 
-def stats(trades, max_drawdown):
+def calculate_stats(
+    trades,
+    max_drawdown,
+):
+
     count = len(trades)
 
     gross = sum(
-        x["gross"] for x in trades
+        trade["gross"]
+        for trade in trades
     )
 
     fees = sum(
-        x["fees"] for x in trades
+        trade["fees"]
+        for trade in trades
     )
 
     net = sum(
-        x["net"] for x in trades
+        trade["net"]
+        for trade in trades
     )
 
     winners = [
-        x["net"]
-        for x in trades
-        if x["net"] > 0
+        trade["net"]
+        for trade in trades
+        if trade["net"] > 0
     ]
 
     losers = [
-        x["net"]
-        for x in trades
-        if x["net"] <= 0
+        trade["net"]
+        for trade in trades
+        if trade["net"] <= 0
     ]
 
-    profit = sum(winners)
-    loss = abs(sum(losers))
+    gross_profit = sum(
+        winners
+    )
 
-    if loss > 0:
-        pf = profit / loss
-    elif profit > 0:
-        pf = math.inf
+    gross_loss = abs(
+        sum(losers)
+    )
+
+    if gross_loss > 0:
+        profit_factor = (
+            gross_profit
+            / gross_loss
+        )
+
+    elif gross_profit > 0:
+        profit_factor = math.inf
+
     else:
-        pf = 0.0
+        profit_factor = 0.0
 
     win_rate = (
-        len(winners) / count * 100
+        len(winners)
+        / count
+        * 100.0
         if count
         else 0.0
     )
@@ -690,32 +977,69 @@ def stats(trades, max_drawdown):
         else 0.0
     )
 
+    targets = sum(
+        1
+        for trade in trades
+        if trade["reason"] == "TARGET"
+    )
+
+    stops = sum(
+        1
+        for trade in trades
+        if trade["reason"] == "STOP"
+    )
+
+    time_exits = sum(
+        1
+        for trade in trades
+        if trade["reason"] == "TIME"
+    )
+
     return {
-        "trades": count,
-        "gross": gross,
-        "fees": fees,
-        "net": net,
-        "return": (
-            net / STARTING_CASH * 100
-        ),
-        "win_rate": win_rate,
-        "pf": pf,
-        "expectancy": expectancy,
-        "avg_gross": avg_gross,
-        "avg_fee": avg_fee,
-        "dd": max_drawdown * 100,
-        "targets": sum(
-            x["reason"] == "TARGET"
-            for x in trades
-        ),
-        "stops": sum(
-            x["reason"] == "STOP"
-            for x in trades
-        ),
-        "times": sum(
-            x["reason"] == "TIME"
-            for x in trades
-        ),
+        "trades":
+            count,
+
+        "gross":
+            gross,
+
+        "fees":
+            fees,
+
+        "net":
+            net,
+
+        "return":
+            net
+            / STARTING_CASH
+            * 100.0,
+
+        "win_rate":
+            win_rate,
+
+        "pf":
+            profit_factor,
+
+        "expectancy":
+            expectancy,
+
+        "avg_gross":
+            avg_gross,
+
+        "avg_fee":
+            avg_fee,
+
+        "dd":
+            max_drawdown
+            * 100.0,
+
+        "targets":
+            targets,
+
+        "stops":
+            stops,
+
+        "times":
+            time_exits,
     }
 
 
@@ -727,55 +1051,81 @@ def pf_text(value):
 
 
 # ============================================================
-# CHRONOLOGICAL WINDOWS
-#
-# Four consecutive ~6-month windows.
-# This helps expose regime dependence.
+# FOUR CHRONOLOGICAL WINDOWS
 # ============================================================
 
 def make_windows(candles):
     n = len(candles)
 
-    quarter = n // 4
+    quarter = (
+        n // 4
+    )
 
     return [
         (
             "WINDOW 1",
-            candles[0:quarter],
+            candles[
+                0:
+                quarter
+            ],
         ),
+
         (
             "WINDOW 2",
-            candles[quarter:quarter * 2],
+            candles[
+                quarter:
+                quarter * 2
+            ],
         ),
+
         (
             "WINDOW 3",
-            candles[quarter * 2:quarter * 3],
+            candles[
+                quarter * 2:
+                quarter * 3
+            ],
         ),
+
         (
             "WINDOW 4",
-            candles[quarter * 3:],
+            candles[
+                quarter * 3:
+            ],
         ),
     ]
 
 
 # ============================================================
-# TEST ONE PRODUCT
+# TEST PRODUCT
 # ============================================================
 
-def test_product(product, candles):
+def test_product(
+    product,
+    candles,
+):
 
-    windows = make_windows(candles)
+    windows = make_windows(
+        candles
+    )
 
     print()
     print("=" * 80)
-    print(f"{product} | V6")
+
+    print(
+        f"{product} | V6"
+    )
+
     print("=" * 80)
 
     for strategy in STRATEGIES:
 
         print()
         print("#" * 80)
-        print(strategy["name"])
+
+        print(
+            strategy["name"]
+        )
+
         print("#" * 80)
 
         print(
@@ -784,7 +1134,13 @@ def test_product(product, candles):
         )
 
         print(
-            f"EMA: {strategy['trend_ema']}"
+            f"Trend EMA: "
+            f"{strategy['trend_ema']}"
+        )
+
+        print(
+            f"Volume filter: "
+            f"{strategy['volume_mult']}x"
         )
 
         print(
@@ -799,16 +1155,21 @@ def test_product(product, candles):
         )
 
         # ====================================================
-        # ZERO-COST REGIME TEST
+        # ZERO-COST WINDOW TEST
         # ====================================================
 
         positive_windows = 0
         total_window_trades = 0
 
         print()
-        print("ZERO-COST WINDOW TEST")
+        print(
+            "ZERO-COST WINDOW TEST"
+        )
 
-        for window_name, window in windows:
+        for (
+            window_name,
+            window,
+        ) in windows:
 
             result = backtest(
                 window,
@@ -823,7 +1184,8 @@ def test_product(product, candles):
 
             if (
                 result["net"] > 0
-                and result["pf"] > 1.0
+                and
+                result["pf"] > 1.0
             ):
                 positive_windows += 1
 
@@ -842,17 +1204,20 @@ def test_product(product, candles):
         )
 
         # ====================================================
-        # FULL TWO-YEAR COST TEST
+        # FULL 730-DAY COST TEST
         # ====================================================
 
         print()
-        print("FULL-PERIOD COST TEST")
+        print(
+            "FULL-PERIOD COST TEST"
+        )
 
         full_results = {}
 
-        for scenario_name, costs in (
-            COST_SCENARIOS.items()
-        ):
+        for (
+            scenario_name,
+            costs,
+        ) in COST_SCENARIOS.items():
 
             result = backtest(
                 candles,
@@ -865,15 +1230,17 @@ def test_product(product, candles):
                 scenario_name
             ] = result
 
-            status = (
-                "PASS"
-                if (
-                    result["net"] > 0
-                    and result["pf"] > 1.0
-                    and result["expectancy"] > 0
-                )
-                else "FAIL"
-            )
+            if (
+                result["net"] > 0
+                and
+                result["pf"] > 1.0
+                and
+                result["expectancy"] > 0
+            ):
+                status = "PASS"
+
+            else:
+                status = "FAIL"
 
             print(
                 f"{scenario_name}: "
@@ -886,15 +1253,30 @@ def test_product(product, candles):
                 f"${result['expectancy']:+.2f}"
             )
 
-        zero = full_results["ZERO COST"]
+        zero = (
+            full_results[
+                "ZERO COST"
+            ]
+        )
+
+        maker = (
+            full_results[
+                "MAKER 0.40%"
+            ]
+        )
+
+        maker_slip = (
+            full_results[
+                "MAKER 0.40% + 0.05% SLIP"
+            ]
+        )
 
         print()
+
         print(
             f"ZERO-COST avg gross/trade: "
             f"${zero['avg_gross']:+.2f}"
         )
-
-        maker = full_results["MAKER 0.40%"]
 
         print(
             f"MAKER avg fee/trade: "
@@ -913,15 +1295,11 @@ def test_product(product, candles):
             f"{zero['dd']:.2f}%"
         )
 
-        # ====================================================
-        # SURVIVAL LABEL
-        # ====================================================
-
-        maker_slip = full_results[
-            "MAKER 0.40% + 0.05% SLIP"
-        ]
-
         print()
+
+        # ====================================================
+        # RESULT
+        # ====================================================
 
         if (
             positive_windows >= 3
@@ -931,10 +1309,12 @@ def test_product(product, candles):
             maker_slip["net"] > 0
             and
             maker_slip["pf"] > 1.0
+            and
+            maker_slip["expectancy"] > 0
         ):
             print(
-                "V6 RESULT: COST-RESISTANT "
-                "CANDIDATE"
+                "V6 RESULT: "
+                "COST-RESISTANT CANDIDATE"
             )
 
         elif (
@@ -943,7 +1323,8 @@ def test_product(product, candles):
             positive_windows >= 2
         ):
             print(
-                "V6 RESULT: GROSS EDGE ONLY"
+                "V6 RESULT: "
+                "GROSS EDGE ONLY"
             )
 
         else:
@@ -975,6 +1356,14 @@ def main():
     )
 
     print(
+        "Downloads Coinbase 1H candles"
+    )
+
+    print(
+        "Automatically converts 1H -> 4H"
+    )
+
+    print(
         "Risk per trade: 1.0%"
     )
 
@@ -986,8 +1375,10 @@ def main():
     for product in PRODUCTS:
 
         try:
-            candles = download_history(
-                product
+            candles = (
+                download_history(
+                    product
+                )
             )
 
             test_product(
