@@ -78,68 +78,8 @@ def rsi(values, period=14):
 # DOWNLOAD HISTORICAL COINBASE CANDLES IN CHUNKS
 # ============================================================
 
-def get_history(client, product, days=DAYS_TO_TEST):
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=days)
-
-    all_candles = {}
-    cursor = start_time
-    batch_number = 0
-
-    # Coinbase allows a maximum window of 300 five-minute candles.
-    batch_seconds = 300 * GRANULARITY_SECONDS
-
-    print(f"Downloading about {days} days of {product} candles...")
-
-    while cursor < end_time:
-        chunk_end = min(
-            cursor + timedelta(seconds=batch_seconds),
-            end_time
-        )
-
-        # Use positional start/end values because some SDK versions
-        # mishandle these values when sent as keyword arguments.
-        response = client.get_public_candles(
-            product_id=product,
-            start=int(cursor.timestamp()),
-            end=int(chunk_end.timestamp()),
-            granularity="FIVE_MINUTE",
-            limit=CANDLES_PER_REQUEST,
-        )
-
-        batch_number += 1
-
-        if response.candles:
-            first_time = min(int(c.start) for c in response.candles)
-            last_time = max(int(c.start) for c in response.candles)
-
-            print(
-                f"Batch {batch_number}: {len(response.candles)} candles "
-                f"{datetime.fromtimestamp(first_time, timezone.utc)} -> "
-                f"{datetime.fromtimestamp(last_time, timezone.utc)}"
-            )
-
-        for c in response.candles:
-            candle = {
-                "time": int(c.start),
-                "open": float(c.open),
-                "high": float(c.high),
-                "low": float(c.low),
-                "close": float(c.close),
-                "volume": float(c.volume),
-            }
-
-            all_candles[candle["time"]] = candle
-
-        cursor = chunk_end
-        time.sleep(0.15)
-
-    candles = list(all_candles.values())
-    candles.sort(key=lambda x: x["time"])
-
-    print(f"Total unique candles downloaded: {len(candles)}")
-
-    return candles
+    CHUNKS
+# ============================================================
 
 
 # ============================================================
