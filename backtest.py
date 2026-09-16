@@ -3,57 +3,62 @@ import json
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from itertools import product
 
 import config
 
 
 # ============================================================
-# DIAGNOSTIC SETTINGS
+# V3 — FEE-AWARE 15-MINUTE STRATEGY
 # ============================================================
 
-DAYS_TO_TEST = 30
-GRANULARITY_SECONDS = 300
+DAYS_TO_TEST = 60
+
+# 15-minute candles
+GRANULARITY_SECONDS = 900
+
+# Coinbase endpoint batch size
 CANDLES_PER_REQUEST = 250
 
-ATR_PERIOD = 14
+TRAIN_RATIO = 0.70
 
-# Keep risk modest while diagnosing.
+STARTING_CASH = float(config.STARTING_CASH)
+
+# Keep risk controlled during testing.
 RISK_PER_TRADE = 0.01
 MAX_POSITION_PCT = 0.30
 
-# Uses whatever fee assumption is currently in config.py
-FEE_RATE = config.FEE_RATE
-
-
-# ============================================================
-# FIXED TEST SETTINGS
-# ============================================================
-
-SETUPS = {
-    "BTC-USD": {
-        "fast": 12,
-        "slow": 30,
-        "trend": 50,
-        "rsi_min": 45,
-        "rsi_max": 65,
-        "volume_mult": 1.1,
-        "atr_stop": 1.5,
-        "atr_target": 2.0,
-        "cooldown": 3,
-    },
-
-    "ETH-USD": {
-        "fast": 12,
-        "slow": 24,
-        "trend": 50,
-        "rsi_min": 45,
-        "rsi_max": 65,
-        "volume_mult": 1.1,
-        "atr_stop": 1.5,
-        "atr_target": 4.0,
-        "cooldown": 6,
-    },
+# Test both execution assumptions.
+FEE_MODELS = {
+    "TAKER": 0.006,
+    "MAKER": 0.004,
 }
+
+ATR_PERIOD = 14
+VOLUME_LOOKBACK = 20
+
+MIN_TRAIN_TRADES = 5
+FINALISTS_TO_VALIDATE = 20
+
+
+# ============================================================
+# SMALL V3 PARAMETER GRID
+# ============================================================
+
+FAST_EMAS = [8, 12]
+SLOW_EMAS = [24, 30]
+TREND_EMAS = [50, 75]
+
+RSI_MINS = [48, 52]
+RSI_MAXS = [68, 72]
+
+VOLUME_MULTS = [0.9, 1.1]
+
+ATR_STOP_MULTS = [1.5, 2.0]
+ATR_TARGET_MULTS = [3.0, 4.0, 5.0]
+
+# Target must exceed round-trip fees by this multiple.
+FEE_EDGE_MULTS = [2.0, 3.0]
 
 
 # ============================================================
@@ -74,7 +79,6 @@ def ema(values, period):
             value * multiplier
             + current * (1 - multiplier)
         )
-
         output.append(current)
 
     return output
@@ -100,13 +104,9 @@ def rsi(values, period=14):
 
     if avg_loss == 0:
         output[period] = 100.0
-
     else:
         rs = avg_gain / avg_loss
-
-        output[period] = (
-            100 - (100 / (1 + rs))
-        )
+        output[period] = 100 - (100 / (1 + rs))
 
     for i in range(period + 1, len(values)):
         change = values[i] - values[i - 1]
@@ -124,13 +124,9 @@ def rsi(values, period=14):
 
         if avg_loss == 0:
             output[i] = 100.0
-
         else:
             rs = avg_gain / avg_loss
-
-            output[i] = (
-                100 - (100 / (1 + rs))
-            )
+            output[i] = 100 - (100 / (1 + rs))
 
     return output
 
@@ -142,10 +138,7 @@ def atr(candles, period=14):
     for i in range(1, len(candles)):
         high = candles[i]["high"]
         low = candles[i]["low"]
-
-        previous_close = (
-            candles[i - 1]["close"]
-        )
+        previous_close = candles[i - 1]["close"]
 
         true_ranges[i] = max(
             high - low,
@@ -182,9 +175,7 @@ def atr(candles, period=14):
 # ============================================================
 
 def iso_time(dt):
-    return dt.strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_history(product_name):
@@ -202,8 +193,7 @@ def get_history(product_name):
     )
 
     start_time = (
-        end_time
-        - timedelta(days=DAYS_TO_TEST)
+        end_time - timedelta(days=DAYS_TO_TEST)
     )
 
     all_candles = {}
@@ -219,14 +209,12 @@ def get_history(product_name):
     print()
     print(
         f"Downloading {DAYS_TO_TEST} days "
-        f"of {product_name}..."
+        f"of {product_name} 15m candles..."
     )
 
     while cursor < end_time:
         chunk_end = min(
-            cursor + timedelta(
-                seconds=chunk_seconds
-            ),
+            cursor + timedelta(seconds=chunk_seconds),
             end_time,
         )
 
@@ -246,9 +234,8 @@ def get_history(product_name):
             url,
             headers={
                 "User-Agent":
-                    "coinbase-paper-diagnostic/1.0",
-                "Accept":
-                    "application/json",
+                    "coinbase-paper-v3-backtester/1.0",
+                "Accept": "application/json",
             },
         )
 
@@ -279,13 +266,11 @@ def get_history(product_name):
                 "volume": float(c[5]),
             }
 
-            all_candles[
-                candle["time"]
-            ] = candle
+            all_candles[candle["time"]] = candle
 
         batches += 1
 
-        if batches % 10 == 0:
+        if batches % 5 == 0:
             print(
                 f"Downloaded {batches} batches..."
             )
@@ -294,52 +279,52 @@ def get_history(product_name):
 
         time.sleep(0.20)
 
-    candles = list(
-        all_candles.values()
-    )
+    candles = list(all_candles.values())
 
     candles.sort(
         key=lambda x: x["time"]
     )
 
     print(
-        f"Total unique candles: "
-        f"{len(candles)}"
+        f"Total unique candles: {len(candles)}"
     )
 
     return candles
 
 
 # ============================================================
-# DIAGNOSTIC BACKTEST
+# V3 BACKTEST
 # ============================================================
 
-def run_diagnostic(product_name, candles):
-    settings = SETUPS[product_name]
+def run_strategy(
+    candles,
+    fee_rate,
+    fast_period,
+    slow_period,
+    trend_period,
+    rsi_min,
+    rsi_max,
+    volume_mult,
+    atr_stop_mult,
+    atr_target_mult,
+    fee_edge_mult,
+):
+
+    if len(candles) < 200:
+        return None
 
     closes = [
         candle["close"]
         for candle in candles
     ]
 
-    fast = ema(
-        closes,
-        settings["fast"]
-    )
-
-    slow = ema(
-        closes,
-        settings["slow"]
-    )
-
-    trend = ema(
-        closes,
-        settings["trend"]
-    )
+    fast = ema(closes, fast_period)
+    slow = ema(closes, slow_period)
+    trend = ema(closes, trend_period)
 
     rsi_values = rsi(
         closes,
-        config.RSI_PERIOD
+        14
     )
 
     atr_values = atr(
@@ -347,21 +332,22 @@ def run_diagnostic(product_name, candles):
         ATR_PERIOD
     )
 
-    cash = float(
-        config.STARTING_CASH
-    )
+    cash = STARTING_CASH
 
     position = None
+    pending_entry = None
+
     trades = []
 
-    cooldown_until = 0
+    peak_equity = cash
+    max_drawdown = 0.0
 
     start_index = max(
-        settings["trend"] + 2,
-        settings["slow"] + 2,
-        config.VOLUME_LOOKBACK + 2,
-        config.RSI_PERIOD + 2,
-        ATR_PERIOD + 2,
+        trend_period + 3,
+        slow_period + 3,
+        VOLUME_LOOKBACK + 3,
+        ATR_PERIOD + 3,
+        20,
     )
 
     for i in range(
@@ -369,7 +355,79 @@ def run_diagnostic(product_name, candles):
         len(candles)
     ):
         candle = candles[i]
-        price = candle["close"]
+
+        # ====================================================
+        # EXECUTE SIGNAL AT NEXT CANDLE OPEN
+        # ====================================================
+
+        if (
+            pending_entry is not None
+            and position is None
+        ):
+            entry_price = candle["open"]
+
+            stop_distance = (
+                pending_entry["atr"]
+                * atr_stop_mult
+            )
+
+            target_distance = (
+                pending_entry["atr"]
+                * atr_target_mult
+            )
+
+            if stop_distance > 0:
+                risk_dollars = (
+                    cash * RISK_PER_TRADE
+                )
+
+                qty_by_risk = (
+                    risk_dollars
+                    / stop_distance
+                )
+
+                qty_by_position = (
+                    cash
+                    * MAX_POSITION_PCT
+                    / entry_price
+                )
+
+                qty = min(
+                    qty_by_risk,
+                    qty_by_position
+                )
+
+                if qty > 0:
+                    entry_value = (
+                        qty * entry_price
+                    )
+
+                    entry_fee = (
+                        entry_value
+                        * fee_rate
+                    )
+
+                    total_cost = (
+                        entry_value
+                        + entry_fee
+                    )
+
+                    if total_cost <= cash:
+                        cash -= total_cost
+
+                        position = {
+                            "entry": entry_price,
+                            "qty": qty,
+                            "entry_fee": entry_fee,
+                            "stop":
+                                entry_price
+                                - stop_distance,
+                            "target":
+                                entry_price
+                                + target_distance,
+                        }
+
+            pending_entry = None
 
         # ====================================================
         # EXIT
@@ -379,29 +437,29 @@ def run_diagnostic(product_name, candles):
             exit_price = None
             reason = None
 
-            if (
+            stop_hit = (
                 candle["low"]
                 <= position["stop"]
-            ):
-                exit_price = (
-                    position["stop"]
-                )
+            )
 
-                reason = "STOP"
-
-            elif (
+            target_hit = (
                 candle["high"]
                 >= position["target"]
-            ):
-                exit_price = (
-                    position["target"]
-                )
+            )
 
+            # Conservative if both happen in same candle.
+            if stop_hit:
+                exit_price = position["stop"]
+                reason = "STOP"
+
+            elif target_hit:
+                exit_price = position["target"]
                 reason = "TARGET"
 
-            elif price < slow[i]:
-                exit_price = price
-                reason = "TREND_EXIT"
+            # Only use slow EMA as emergency trend failure.
+            elif candle["close"] < trend[i]:
+                exit_price = candle["close"]
+                reason = "TREND"
 
             if exit_price is not None:
                 exit_value = (
@@ -411,7 +469,7 @@ def run_diagnostic(product_name, candles):
 
                 exit_fee = (
                     exit_value
-                    * FEE_RATE
+                    * fee_rate
                 )
 
                 gross_pnl = (
@@ -422,77 +480,47 @@ def run_diagnostic(product_name, candles):
                     * position["qty"]
                 )
 
-                total_fees = (
-                    position["entry_fee"]
-                    + exit_fee
-                )
-
                 net_pnl = (
                     gross_pnl
-                    - total_fees
-                )
-
-                cash += (
-                    exit_value
+                    - position["entry_fee"]
                     - exit_fee
                 )
 
-                trade = {
-                    "entry_time":
-                        position["entry_time"],
+                cash += (
+                    exit_value - exit_fee
+                )
 
-                    "exit_time":
-                        candle["time"],
-
-                    "entry":
-                        position["entry"],
-
-                    "exit":
-                        exit_price,
-
-                    "qty":
-                        position["qty"],
-
-                    "gross_pnl":
-                        gross_pnl,
-
-                    "entry_fee":
-                        position["entry_fee"],
-
-                    "exit_fee":
-                        exit_fee,
-
-                    "total_fees":
-                        total_fees,
-
-                    "net_pnl":
-                        net_pnl,
-
-                    "reason":
-                        reason,
-                }
-
-                trades.append(trade)
+                trades.append({
+                    "gross": gross_pnl,
+                    "fees":
+                        position["entry_fee"]
+                        + exit_fee,
+                    "net": net_pnl,
+                    "reason": reason,
+                })
 
                 position = None
 
-                cooldown_until = (
-                    i
-                    + settings["cooldown"]
-                )
-
         # ====================================================
-        # ENTRY
+        # SIGNAL
         # ====================================================
 
         if (
             position is None
-            and i >= cooldown_until
+            and pending_entry is None
+            and i < len(candles) - 1
         ):
+            current_atr = atr_values[i]
+
+            if current_atr <= 0:
+                continue
+
+            price = candle["close"]
+
             volume_window = [
                 candles[j]["volume"]
                 for j in range(
-                    i - config.VOLUME_LOOKBACK,
+                    i - VOLUME_LOOKBACK,
                     i
                 )
             ]
@@ -502,460 +530,430 @@ def run_diagnostic(product_name, candles):
                 / len(volume_window)
             )
 
-            current_atr = (
-                atr_values[i]
-            )
-
-            if current_atr <= 0:
-                continue
-
-            crossover = (
-                fast[i - 1]
-                <= slow[i - 1]
-                and
-                fast[i]
-                > slow[i]
-            )
-
+            # Trend alignment.
             trend_ok = (
-                price > trend[i]
+                fast[i] > slow[i]
                 and
                 slow[i] > trend[i]
+                and
+                price > trend[i]
             )
 
-            rsi_ok = (
-                settings["rsi_min"]
+            # Slow EMA must actually be rising.
+            trend_slope_ok = (
+                slow[i]
+                > slow[i - 3]
+            )
+
+            # Instead of demanding only one exact crossover,
+            # look for price reclaiming fast EMA.
+            pullback_reclaim = (
+                closes[i - 1]
+                <= fast[i - 1]
+                and
+                closes[i]
+                > fast[i]
+            )
+
+            momentum_ok = (
+                rsi_min
                 <= rsi_values[i]
-                <= settings["rsi_max"]
+                <= rsi_max
             )
 
             volume_ok = (
                 candle["volume"]
-                >= (
-                    avg_volume
-                    * settings["volume_mult"]
-                )
+                >= avg_volume * volume_mult
             )
 
-            atr_percent = (
-                current_atr / price
-            )
+            # =================================================
+            # FEE-AWARE FILTER
+            # =================================================
 
-            volatility_ok = (
-                atr_percent >= 0.001
-            )
-
-            signal = (
-                crossover
-                and trend_ok
-                and rsi_ok
-                and volume_ok
-                and volatility_ok
-            )
-
-            if not signal:
-                continue
-
-            stop_distance = (
+            projected_target_pct = (
                 current_atr
-                * settings["atr_stop"]
-            )
-
-            target_distance = (
-                current_atr
-                * settings["atr_target"]
-            )
-
-            if stop_distance <= 0:
-                continue
-
-            stop_price = (
-                price - stop_distance
-            )
-
-            target_price = (
-                price + target_distance
-            )
-
-            risk_dollars = (
-                cash * RISK_PER_TRADE
-            )
-
-            qty_by_risk = (
-                risk_dollars
-                / stop_distance
-            )
-
-            max_position_value = (
-                cash
-                * MAX_POSITION_PCT
-            )
-
-            qty_by_position = (
-                max_position_value
+                * atr_target_mult
                 / price
             )
 
-            qty = min(
-                qty_by_risk,
-                qty_by_position
+            estimated_round_trip_fee = (
+                fee_rate * 2
             )
 
-            if qty <= 0:
-                continue
-
-            entry_value = (
-                qty * price
+            minimum_required_move = (
+                estimated_round_trip_fee
+                * fee_edge_mult
             )
 
-            entry_fee = (
-                entry_value
-                * FEE_RATE
+            fee_edge_ok = (
+                projected_target_pct
+                >= minimum_required_move
             )
 
-            total_entry_cost = (
-                entry_value
-                + entry_fee
+            signal = (
+                trend_ok
+                and trend_slope_ok
+                and pullback_reclaim
+                and momentum_ok
+                and volume_ok
+                and fee_edge_ok
             )
 
-            if total_entry_cost > cash:
-                qty = (
-                    cash
-                    / (
-                        price
-                        * (1 + FEE_RATE)
-                    )
-                )
+            if signal:
+                pending_entry = {
+                    "atr": current_atr
+                }
 
-                entry_value = (
-                    qty * price
-                )
+        # ====================================================
+        # EQUITY / DRAWDOWN
+        # ====================================================
 
-                entry_fee = (
-                    entry_value
-                    * FEE_RATE
-                )
+        equity = cash
 
-                total_entry_cost = (
-                    entry_value
-                    + entry_fee
-                )
+        if position is not None:
+            equity += (
+                position["qty"]
+                * candle["close"]
+            )
 
-            cash -= total_entry_cost
+        peak_equity = max(
+            peak_equity,
+            equity
+        )
 
-            position = {
-                "entry_time":
-                    candle["time"],
+        if peak_equity > 0:
+            drawdown = (
+                peak_equity - equity
+            ) / peak_equity
 
-                "entry":
-                    price,
-
-                "qty":
-                    qty,
-
-                "entry_fee":
-                    entry_fee,
-
-                "stop":
-                    stop_price,
-
-                "target":
-                    target_price,
-            }
+            max_drawdown = max(
+                max_drawdown,
+                drawdown
+            )
 
     # ========================================================
-    # FINAL OPEN POSITION
+    # CLOSE FINAL POSITION
     # ========================================================
 
     if position is not None:
-        candle = candles[-1]
-
-        exit_price = (
-            candle["close"]
+        final_price = (
+            candles[-1]["close"]
         )
 
         exit_value = (
             position["qty"]
-            * exit_price
+            * final_price
         )
 
         exit_fee = (
-            exit_value
-            * FEE_RATE
+            exit_value * fee_rate
         )
 
         gross_pnl = (
             (
-                exit_price
+                final_price
                 - position["entry"]
             )
             * position["qty"]
         )
 
-        total_fees = (
-            position["entry_fee"]
-            + exit_fee
-        )
-
         net_pnl = (
             gross_pnl
-            - total_fees
-        )
-
-        cash += (
-            exit_value
+            - position["entry_fee"]
             - exit_fee
         )
 
+        cash += (
+            exit_value - exit_fee
+        )
+
         trades.append({
-            "entry_time":
-                position["entry_time"],
-
-            "exit_time":
-                candle["time"],
-
-            "entry":
-                position["entry"],
-
-            "exit":
-                exit_price,
-
-            "qty":
-                position["qty"],
-
-            "gross_pnl":
-                gross_pnl,
-
-            "entry_fee":
-                position["entry_fee"],
-
-            "exit_fee":
-                exit_fee,
-
-            "total_fees":
-                total_fees,
-
-            "net_pnl":
-                net_pnl,
-
-            "reason":
-                "END",
+            "gross": gross_pnl,
+            "fees":
+                position["entry_fee"]
+                + exit_fee,
+            "net": net_pnl,
+            "reason": "END",
         })
 
-    # ========================================================
-    # PRINT EVERY TRADE
-    # ========================================================
+    total_gross = sum(
+        t["gross"]
+        for t in trades
+    )
+
+    total_fees = sum(
+        t["fees"]
+        for t in trades
+    )
+
+    total_net = sum(
+        t["net"]
+        for t in trades
+    )
+
+    wins = sum(
+        1
+        for t in trades
+        if t["net"] > 0
+    )
+
+    targets = sum(
+        1
+        for t in trades
+        if t["reason"] == "TARGET"
+    )
+
+    stops = sum(
+        1
+        for t in trades
+        if t["reason"] == "STOP"
+    )
+
+    trend_exits = sum(
+        1
+        for t in trades
+        if t["reason"] == "TREND"
+    )
+
+    trade_count = len(trades)
+
+    win_rate = (
+        wins / trade_count * 100
+        if trade_count
+        else 0.0
+    )
+
+    return_pct = (
+        total_net
+        / STARTING_CASH
+        * 100
+    )
+
+    return {
+        "trades": trade_count,
+        "wins": wins,
+        "win_rate": win_rate,
+        "gross": total_gross,
+        "fees": total_fees,
+        "net": total_net,
+        "return_pct": return_pct,
+        "drawdown": max_drawdown * 100,
+        "targets": targets,
+        "stops": stops,
+        "trend_exits": trend_exits,
+    }
+
+
+# ============================================================
+# OPTIMIZATION
+# ============================================================
+
+def optimize(
+    product_name,
+    candles,
+    fee_name,
+    fee_rate,
+):
+
+    split = int(
+        len(candles) * TRAIN_RATIO
+    )
+
+    training = candles[:split]
+    validation = candles[split:]
+
+    combinations = list(
+        product(
+            FAST_EMAS,
+            SLOW_EMAS,
+            TREND_EMAS,
+            RSI_MINS,
+            RSI_MAXS,
+            VOLUME_MULTS,
+            ATR_STOP_MULTS,
+            ATR_TARGET_MULTS,
+            FEE_EDGE_MULTS,
+        )
+    )
+
+    combinations = [
+        combo
+        for combo in combinations
+        if combo[0] < combo[1]
+        and combo[1] < combo[2]
+        and combo[3] < combo[4]
+    ]
 
     print()
     print("=" * 72)
 
     print(
-        f"{product_name} ACCOUNTING DIAGNOSTIC"
+        f"{product_name} | "
+        f"{fee_name} FEE MODEL"
     )
 
     print("=" * 72)
 
     print(
-        f"Fee rate used PER SIDE: "
-        f"{FEE_RATE * 100:.4f}%"
+        f"Fee per side: "
+        f"{fee_rate * 100:.2f}%"
     )
 
     print(
-        f"Starting cash: "
-        f"${config.STARTING_CASH:,.2f}"
+        f"Training candles: {len(training)}"
+    )
+
+    print(
+        f"Validation candles: {len(validation)}"
+    )
+
+    print(
+        f"Combinations: {len(combinations)}"
+    )
+
+    results = []
+
+    for combo in combinations:
+        result = run_strategy(
+            training,
+            fee_rate,
+            *combo
+        )
+
+        if (
+            result is not None
+            and result["trades"]
+            >= MIN_TRAIN_TRADES
+        ):
+            results.append({
+                "settings": combo,
+                "train": result,
+            })
+
+    if not results:
+        print(
+            "No strategies produced enough trades."
+        )
+        return
+
+    results.sort(
+        key=lambda x: (
+            x["train"]["return_pct"]
+            - x["train"]["drawdown"] * 0.5
+        ),
+        reverse=True
+    )
+
+    finalists = (
+        results[:FINALISTS_TO_VALIDATE]
+    )
+
+    validated = []
+
+    for candidate in finalists:
+        valid = run_strategy(
+            validation,
+            fee_rate,
+            *candidate["settings"]
+        )
+
+        if valid is None:
+            continue
+
+        validated.append({
+            "settings":
+                candidate["settings"],
+            "train":
+                candidate["train"],
+            "valid":
+                valid,
+        })
+
+    validated.sort(
+        key=lambda x: (
+            x["valid"]["return_pct"]
+            - x["valid"]["drawdown"] * 0.5
+        ),
+        reverse=True
     )
 
     print()
+    print("TOP VALIDATION RESULTS")
+    print()
 
-    total_gross = 0.0
-    total_fees = 0.0
-    total_net = 0.0
-
-    for number, trade in enumerate(
-        trades,
+    for rank, candidate in enumerate(
+        validated[:5],
         start=1
     ):
-        entry_dt = datetime.fromtimestamp(
-            trade["entry_time"],
-            timezone.utc
-        )
+        (
+            fast,
+            slow,
+            trend,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            atr_stop,
+            atr_target,
+            fee_edge,
+        ) = candidate["settings"]
 
-        exit_dt = datetime.fromtimestamp(
-            trade["exit_time"],
-            timezone.utc
-        )
-
-        total_gross += (
-            trade["gross_pnl"]
-        )
-
-        total_fees += (
-            trade["total_fees"]
-        )
-
-        total_net += (
-            trade["net_pnl"]
-        )
+        train = candidate["train"]
+        valid = candidate["valid"]
 
         print("-" * 72)
+        print(f"CANDIDATE {rank}")
 
         print(
-            f"TRADE {number} | "
-            f"{trade['reason']}"
+            f"EMA: {fast}/{slow}/{trend}"
         )
 
         print(
-            f"Entry: {entry_dt} | "
-            f"${trade['entry']:,.2f}"
+            f"RSI: {rsi_min}-{rsi_max}"
         )
 
         print(
-            f"Exit:  {exit_dt} | "
-            f"${trade['exit']:,.2f}"
+            f"Volume: {volume_mult}x"
         )
 
         print(
-            f"Quantity: "
-            f"{trade['qty']:.8f}"
+            f"ATR stop/target: "
+            f"{atr_stop}x / {atr_target}x"
         )
 
         print(
-            f"Gross P/L: "
-            f"${trade['gross_pnl']:,.2f}"
+            f"Fee-edge requirement: "
+            f"{fee_edge}x round-trip fees"
         )
 
         print(
-            f"Entry fee: "
-            f"${trade['entry_fee']:,.2f}"
+            f"TRAIN -> "
+            f"{train['return_pct']:+.2f}% | "
+            f"{train['trades']} trades | "
+            f"{train['win_rate']:.1f}% win | "
+            f"DD {train['drawdown']:.2f}%"
         )
 
         print(
-            f"Exit fee:  "
-            f"${trade['exit_fee']:,.2f}"
+            f"VALID -> "
+            f"{valid['return_pct']:+.2f}% | "
+            f"{valid['trades']} trades | "
+            f"{valid['win_rate']:.1f}% win | "
+            f"DD {valid['drawdown']:.2f}%"
         )
 
         print(
-            f"Total fees: "
-            f"${trade['total_fees']:,.2f}"
+            f"VALID money -> "
+            f"Gross ${valid['gross']:+.2f} | "
+            f"Fees ${valid['fees']:.2f} | "
+            f"Net ${valid['net']:+.2f}"
         )
 
         print(
-            f"NET P/L: "
-            f"${trade['net_pnl']:,.2f}"
+            f"VALID exits -> "
+            f"Targets {valid['targets']} | "
+            f"Stops {valid['stops']} | "
+            f"Trend {valid['trend_exits']}"
         )
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    gross_winners = sum(
-        1
-        for trade in trades
-        if trade["gross_pnl"] > 0
-    )
-
-    net_winners = sum(
-        1
-        for trade in trades
-        if trade["net_pnl"] > 0
-    )
-
-    net_losers = (
-        len(trades)
-        - net_winners
-    )
-
-    ending_cash_check = (
-        config.STARTING_CASH
-        + total_net
-    )
-
-    actual_change = (
-        cash
-        - config.STARTING_CASH
-    )
-
-    accounting_difference = (
-        actual_change
-        - total_net
-    )
-
-    print()
-    print("=" * 72)
-    print("SUMMARY")
-    print("=" * 72)
-
-    print(
-        f"Trades: "
-        f"{len(trades)}"
-    )
-
-    print(
-        f"Gross winning trades: "
-        f"{gross_winners}"
-    )
-
-    print(
-        f"Net winning trades: "
-        f"{net_winners}"
-    )
-
-    print(
-        f"Net losing trades: "
-        f"{net_losers}"
-    )
-
-    print(
-        f"Total gross P/L: "
-        f"${total_gross:,.2f}"
-    )
-
-    print(
-        f"Total fees: "
-        f"${total_fees:,.2f}"
-    )
-
-    print(
-        f"Total net P/L: "
-        f"${total_net:,.2f}"
-    )
-
-    print(
-        f"Ending cash: "
-        f"${cash:,.2f}"
-    )
-
-    print(
-        f"Expected ending cash: "
-        f"${ending_cash_check:,.2f}"
-    )
-
-    print(
-        f"Accounting difference: "
-        f"${accounting_difference:,.8f}"
-    )
-
-    print()
-
-    if abs(accounting_difference) < 0.01:
-        print(
-            "ACCOUNTING CHECK: PASS"
-        )
-    else:
-        print(
-            "ACCOUNTING CHECK: FAIL"
-        )
-
-    if trades:
-        print(
-            f"Net win rate: "
-            f"{net_winners / len(trades) * 100:.2f}%"
-        )
-
-    print(
-        f"Return: "
-        f"{actual_change / config.STARTING_CASH * 100:.2f}%"
-    )
 
 
 # ============================================================
@@ -964,7 +962,11 @@ def run_diagnostic(product_name, candles):
 
 def main():
     print(
-        "BTC/ETH BACKTEST ACCOUNTING AUDIT"
+        "BTC/ETH STRATEGY V3"
+    )
+
+    print(
+        "15-MINUTE FEE-AWARE BACKTEST"
     )
 
     print(
@@ -972,12 +974,11 @@ def main():
     )
 
     print(
-        f"Test period: {DAYS_TO_TEST} days"
+        f"Historical period: {DAYS_TO_TEST} days"
     )
 
     print(
-        f"Configured fee per side: "
-        f"{FEE_RATE * 100:.4f}%"
+        "Testing maker and taker fee assumptions separately."
     )
 
     for product_name in config.PRODUCTS:
@@ -986,16 +987,18 @@ def main():
                 product_name
             )
 
-            run_diagnostic(
-                product_name,
-                candles
-            )
+            for fee_name, fee_rate in FEE_MODELS.items():
+                optimize(
+                    product_name,
+                    candles,
+                    fee_name,
+                    fee_rate,
+                )
 
         except Exception as exc:
             print(
                 f"{product_name} ERROR: "
-                f"{type(exc).__name__}: "
-                f"{exc}"
+                f"{type(exc).__name__}: {exc}"
             )
 
 
