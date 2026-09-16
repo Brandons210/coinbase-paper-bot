@@ -6,20 +6,14 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# NASDAQ 5-MINUTE SCALPER V1
-# INTRADAY / DAY-TRADING RESEARCH
-# BACKTEST ONLY
+# NASDAQ 5-MINUTE SCALPER V2
+# SELECTIVE EMA + VWAP MOMENTUM
+# BACKTEST / PAPER RESEARCH ONLY
 #
 # LIVE ORDER PLACEMENT: DISABLED
 #
-# Market signal:
-# Nasdaq Composite (^IXIC)
-#
-# IMPORTANT:
-# ^IXIC is an INDEX and cannot itself be directly traded.
-# This version tests whether short-term Nasdaq price behavior
-# contains an intraday edge worth mapping to a tradable
-# instrument later.
+# ^IXIC is the Nasdaq Composite INDEX.
+# It is being used for signal research.
 # ============================================================
 
 
@@ -37,22 +31,15 @@ SYMBOL = "^IXIC"
 
 INTERVAL = "5m"
 
-# Yahoo generally restricts intraday history.
-# Request a recent period supported by the chart API.
 RANGE = "60d"
 
 
 # ============================================================
-# MARKET SESSION
-#
-# Yahoo timestamps are UTC.
-#
-# To avoid DST complications in V1, Yahoo also provides
-# exchange timezone metadata. We will use the timestamp's
-# America/New_York conversion through zoneinfo.
+# TIMEZONE
 # ============================================================
 
 try:
+
     from zoneinfo import ZoneInfo
 
     EASTERN = ZoneInfo(
@@ -68,41 +55,96 @@ except Exception:
 # INDICATORS
 # ============================================================
 
-ATR_PERIOD = 14
-
-VWAP_LOOKBACK = 0
-
 FAST_EMA = 9
 
 SLOW_EMA = 21
 
+ATR_PERIOD = 14
+
 
 # ============================================================
-# TRADING LIMITS
+# V2 ENTRY QUALITY FILTERS
 # ============================================================
 
-# Don't immediately trade the open.
-TRADE_START_HOUR = 9
-TRADE_START_MINUTE = 45
+# EMA9 must be separated from EMA21 by at least
+# this percentage of price.
+MIN_EMA_SEPARATION_PCT = 0.00025
 
-# Stop opening new positions late in the day.
-LAST_ENTRY_HOUR = 15
-LAST_ENTRY_MINUTE = 30
+# ATR / price must be at least 0.08%.
+MIN_ATR_PCT = 0.0008
 
-# Everything must be flat before market close.
-FORCE_EXIT_HOUR = 15
-FORCE_EXIT_MINUTE = 55
+# Breakout candle body must represent at least
+# 55% of its total high-low range.
+MIN_BODY_RATIO = 0.55
 
-MAX_TRADES_PER_DAY = 4
+# Close should occur in upper portion of candle.
+MIN_CLOSE_LOCATION = 0.70
+
+# Require breakout beyond previous high by a tiny amount.
+MIN_BREAKOUT_PCT = 0.00005
+
+
+# ============================================================
+# TRADING WINDOWS
+#
+# Avoid:
+# - first 15 minutes
+# - much of lunchtime
+# - very late entries
+#
+# WINDOW 1:
+# 09:45 -> 11:30
+#
+# WINDOW 2:
+# 13:30 -> 15:15
+# ============================================================
+
+MORNING_START = (
+    9 * 60 + 45
+)
+
+MORNING_END = (
+    11 * 60 + 30
+)
+
+AFTERNOON_START = (
+    13 * 60 + 30
+)
+
+AFTERNOON_END = (
+    15 * 60 + 15
+)
+
+
+# ============================================================
+# EXIT SETTINGS
+# ============================================================
+
+STOP_ATR = 0.90
+
+TARGET_ATR = 1.80
+
+MAX_HOLD_BARS = 10
+
+FORCE_EXIT_MINUTE = (
+    15 * 60 + 55
+)
+
+
+# ============================================================
+# TRADE FREQUENCY CONTROL
+# ============================================================
+
+MAX_TRADES_PER_DAY = 2
+
+# Wait 3 complete 5-minute bars after exiting.
+COOLDOWN_BARS = 3
 
 
 # ============================================================
 # EXECUTION FRICTION
 #
-# These are research assumptions, NOT promises of actual
-# broker execution costs.
-#
-# Slippage applies on BOTH entry and exit.
+# Slippage applies to BOTH entry and exit.
 # ============================================================
 
 COST_SCENARIOS = {
@@ -130,89 +172,25 @@ COST_SCENARIOS = {
 
 
 # ============================================================
-# THREE FIXED SCALPING STRATEGIES
-#
-# No optimizer yet.
-# ============================================================
-
-STRATEGIES = [
-
-    {
-        "name":
-            "VWAP-MOMENTUM",
-
-        "type":
-            "VWAP",
-
-        "stop_atr":
-            0.8,
-
-        "target_atr":
-            1.4,
-
-        "max_hold":
-            8,
-
-        "min_atr_pct":
-            0.0008,
-    },
-
-    {
-        "name":
-            "EMA-MOMENTUM",
-
-        "type":
-            "EMA",
-
-        "stop_atr":
-            0.9,
-
-        "target_atr":
-            1.8,
-
-        "max_hold":
-            10,
-
-        "min_atr_pct":
-            0.0008,
-    },
-
-    {
-        "name":
-            "OPENING-RANGE",
-
-        "type":
-            "ORB",
-
-        "stop_atr":
-            1.0,
-
-        "target_atr":
-            2.0,
-
-        "max_hold":
-            12,
-
-        "min_atr_pct":
-            0.0010,
-    },
-]
-
-
-# ============================================================
-# BASIC INDICATORS
+# EMA
 # ============================================================
 
 def ema(values, period):
 
     if not values:
+
         return []
 
-    k = 2.0 / (
-        period + 1.0
+    k = (
+        2.0
+        / (
+            period + 1.0
+        )
     )
 
-    current = values[0]
+    current = (
+        values[0]
+    )
 
     result = [
         current
@@ -237,15 +215,21 @@ def ema(values, period):
     return result
 
 
+# ============================================================
+# ATR
+# ============================================================
+
 def atr(candles, period):
 
-    result = [
-        0.0
-    ] * len(candles)
+    result = (
+        [0.0]
+        * len(candles)
+    )
 
-    tr = [
-        0.0
-    ] * len(candles)
+    true_ranges = (
+        [0.0]
+        * len(candles)
+    )
 
     for i in range(
         1,
@@ -261,10 +245,12 @@ def atr(candles, period):
         )
 
         previous_close = (
-            candles[i - 1]["close"]
+            candles[
+                i - 1
+            ]["close"]
         )
 
-        tr[i] = max(
+        true_ranges[i] = max(
 
             high - low,
 
@@ -279,14 +265,17 @@ def atr(candles, period):
             ),
         )
 
-    if len(candles) <= period:
+    if (
+        len(candles)
+        <= period
+    ):
 
         return result
 
     current = (
 
         sum(
-            tr[
+            true_ranges[
                 1:
                 period + 1
             ]
@@ -311,13 +300,11 @@ def atr(candles, period):
                 period - 1
             )
 
-            + tr[i]
+            + true_ranges[i]
 
         ) / period
 
-        result[i] = (
-            current
-        )
+        result[i] = current
 
     return result
 
@@ -355,19 +342,23 @@ def trading_date(
 ):
 
     return (
+
         eastern_datetime(
             candle["time"]
         )
+
         .date()
     )
 
 
-def minutes_after_midnight(
+def market_minute(
     candle
 ):
 
-    dt = eastern_datetime(
-        candle["time"]
+    dt = (
+        eastern_datetime(
+            candle["time"]
+        )
     )
 
     return (
@@ -376,52 +367,43 @@ def minutes_after_midnight(
     )
 
 
-def after_time(
-    candle,
-    hour,
-    minute,
+def valid_entry_time(
+    candle
 ):
 
-    value = (
-        minutes_after_midnight(
+    minute = (
+        market_minute(
             candle
         )
     )
 
-    target = (
-        hour * 60
-        + minute
+    morning = (
+
+        minute >= MORNING_START
+
+        and
+
+        minute < MORNING_END
+    )
+
+    afternoon = (
+
+        minute >= AFTERNOON_START
+
+        and
+
+        minute < AFTERNOON_END
     )
 
     return (
-        value >= target
-    )
-
-
-def before_time(
-    candle,
-    hour,
-    minute,
-):
-
-    value = (
-        minutes_after_midnight(
-            candle
-        )
-    )
-
-    target = (
-        hour * 60
-        + minute
-    )
-
-    return (
-        value < target
+        morning
+        or
+        afternoon
     )
 
 
 # ============================================================
-# DOWNLOAD 5-MINUTE DATA
+# DOWNLOAD 5-MINUTE NASDAQ DATA
 # ============================================================
 
 def download_history(
@@ -463,6 +445,7 @@ def download_history(
     print()
 
     print(
+
         f"Downloading {RANGE} "
         f"of {symbol} "
         f"{INTERVAL} candles..."
@@ -486,22 +469,20 @@ def download_history(
 
     try:
 
-        with (
-            urllib.request.urlopen(
-                request,
-                timeout=30,
-            )
-            as response
-        ):
+        with urllib.request.urlopen(
 
-            data = (
-                json.loads(
+            request,
 
-                    response
-                    .read()
-                    .decode(
-                        "utf-8"
-                    )
+            timeout=30,
+
+        ) as response:
+
+            data = json.loads(
+
+                response
+                .read()
+                .decode(
+                    "utf-8"
                 )
             )
 
@@ -509,27 +490,35 @@ def download_history(
 
         raise RuntimeError(
 
-            "Yahoo download "
+            f"Yahoo download "
             f"failed: {exc}"
         )
 
-    chart = data.get(
-        "chart",
-        {}
+    chart = (
+        data.get(
+            "chart",
+            {}
+        )
     )
 
-    error = chart.get(
-        "error"
+    error = (
+        chart.get(
+            "error"
+        )
     )
 
     if error:
 
         raise RuntimeError(
-            f"Yahoo error: {error}"
+
+            f"Yahoo error: "
+            f"{error}"
         )
 
-    results = chart.get(
-        "result"
+    results = (
+        chart.get(
+            "result"
+        )
     )
 
     if not results:
@@ -538,14 +527,19 @@ def download_history(
             "No Yahoo chart data."
         )
 
-    result = results[0]
+    result = (
+        results[0]
+    )
 
-    timestamps = result.get(
-        "timestamp",
-        []
+    timestamps = (
+        result.get(
+            "timestamp",
+            []
+        )
     )
 
     quotes = (
+
         result
         .get(
             "indicators",
@@ -563,31 +557,43 @@ def download_history(
             "No quote data."
         )
 
-    quote = quotes[0]
-
-    opens = quote.get(
-        "open",
-        []
+    quote = (
+        quotes[0]
     )
 
-    highs = quote.get(
-        "high",
-        []
+    opens = (
+        quote.get(
+            "open",
+            []
+        )
     )
 
-    lows = quote.get(
-        "low",
-        []
+    highs = (
+        quote.get(
+            "high",
+            []
+        )
     )
 
-    closes = quote.get(
-        "close",
-        []
+    lows = (
+        quote.get(
+            "low",
+            []
+        )
     )
 
-    volumes = quote.get(
-        "volume",
-        []
+    closes = (
+        quote.get(
+            "close",
+            []
+        )
+    )
+
+    volumes = (
+        quote.get(
+            "volume",
+            []
+        )
     )
 
     candles = []
@@ -627,15 +633,21 @@ def download_history(
             continue
 
         if (
+
             timestamp is None
+
             or
             open_price is None
+
             or
             high_price is None
+
             or
             low_price is None
+
             or
             close_price is None
+
         ):
 
             continue
@@ -644,7 +656,7 @@ def download_history(
 
             volume = 0.0
 
-        candle = {
+        candles.append({
 
             "time":
                 int(timestamp),
@@ -663,18 +675,16 @@ def download_history(
 
             "volume":
                 float(volume),
-        }
-
-        candles.append(
-            candle
-        )
+        })
 
     candles.sort(
+
         key=lambda x:
             x["time"]
     )
 
     print(
+
         f"Downloaded candles: "
         f"{len(candles)}"
     )
@@ -694,14 +704,17 @@ def download_history(
         )
 
         print(
-            "Range: "
+
+            f"Range: "
             f"{first} -> {last}"
         )
 
     if len(candles) < 500:
 
         raise RuntimeError(
-            "Not enough 5-minute data."
+
+            "Not enough "
+            "5-minute data."
         )
 
     return candles
@@ -715,9 +728,10 @@ def build_session_vwap(
     candles
 ):
 
-    result = [
-        0.0
-    ] * len(candles)
+    result = (
+        [0.0]
+        * len(candles)
+    )
 
     current_day = None
 
@@ -729,11 +743,16 @@ def build_session_vwap(
         candles
     ):
 
-        day = trading_date(
-            candle
+        day = (
+            trading_date(
+                candle
+            )
         )
 
-        if day != current_day:
+        if (
+            day
+            != current_day
+        ):
 
             current_day = day
 
@@ -741,21 +760,26 @@ def build_session_vwap(
 
             cumulative_volume = 0.0
 
-        typical_price = (
+        typical = (
 
             candle["high"]
+
             + candle["low"]
+
             + candle["close"]
 
         ) / 3.0
 
         volume = max(
+
             candle["volume"],
+
             0.0,
         )
 
         cumulative_pv += (
-            typical_price
+
+            typical
             * volume
         )
 
@@ -782,95 +806,29 @@ def build_session_vwap(
 
 
 # ============================================================
-# OPENING RANGE
-#
-# First 15 minutes:
-# 09:30
-# 09:35
-# 09:40
-#
-# Trading begins at 09:45.
+# V2 SIGNAL
 # ============================================================
 
-def build_opening_ranges(
-    candles
-):
-
-    ranges = {}
-
-    for candle in candles:
-
-        dt = eastern_datetime(
-            candle["time"]
-        )
-
-        day = dt.date()
-
-        minute = (
-            dt.hour * 60
-            + dt.minute
-        )
-
-        open_start = (
-            9 * 60 + 30
-        )
-
-        open_end = (
-            9 * 60 + 45
-        )
-
-        if (
-            minute >= open_start
-            and
-            minute < open_end
-        ):
-
-            if day not in ranges:
-
-                ranges[day] = {
-
-                    "high":
-                        candle["high"],
-
-                    "low":
-                        candle["low"],
-                }
-
-            else:
-
-                ranges[day]["high"] = max(
-
-                    ranges[day]["high"],
-
-                    candle["high"],
-                )
-
-                ranges[day]["low"] = min(
-
-                    ranges[day]["low"],
-
-                    candle["low"],
-                )
-
-    return ranges
-
-
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def signal_for_strategy(
+def valid_signal(
     i,
     candles,
-    strategy,
-    fast_ema,
-    slow_ema,
+    fast,
+    slow,
     atr_values,
     vwap,
-    opening_ranges,
 ):
 
-    candle = candles[i]
+    if i < 5:
+
+        return False
+
+    candle = (
+        candles[i]
+    )
+
+    previous = (
+        candles[i - 1]
+    )
 
     price = (
         candle["close"]
@@ -888,6 +846,20 @@ def signal_for_strategy(
 
         return False
 
+    # ========================================================
+    # TIME FILTER
+    # ========================================================
+
+    if not valid_entry_time(
+        candle
+    ):
+
+        return False
+
+    # ========================================================
+    # ATR FILTER
+    # ========================================================
+
     atr_pct = (
 
         current_atr
@@ -897,144 +869,172 @@ def signal_for_strategy(
 
     if (
         atr_pct
-        < strategy[
-            "min_atr_pct"
-        ]
+        < MIN_ATR_PCT
     ):
 
         return False
 
-    # Basic bullish intraday regime.
+    # ========================================================
+    # TREND FILTER
+    # ========================================================
 
-    bullish = (
+    trend_ok = (
 
-        fast_ema[i]
-        > slow_ema[i]
+        fast[i]
+        > slow[i]
 
         and
 
         price
-        > slow_ema[i]
+        > fast[i]
+
+        and
+
+        price
+        > slow[i]
     )
 
-    if not bullish:
+    if not trend_ok:
 
         return False
 
-    strategy_type = (
-        strategy["type"]
+    # ========================================================
+    # EMA SLOPE
+    # ========================================================
+
+    slope_ok = (
+
+        fast[i]
+        > fast[i - 2]
+
+        and
+
+        slow[i]
+        > slow[i - 2]
     )
 
+    if not slope_ok:
+
+        return False
+
     # ========================================================
-    # VWAP MOMENTUM
+    # EMA SEPARATION
     #
-    # Price above VWAP.
-    # Fast EMA above slow EMA.
-    # Current close pushes above previous candle high.
+    # Avoid nearly-flat / tangled EMA conditions.
     # ========================================================
 
-    if strategy_type == "VWAP":
+    separation = (
 
-        if i < 2:
-            return False
+        fast[i]
+        - slow[i]
 
-        return (
+    ) / price
 
-            price
-            > vwap[i]
+    if (
+        separation
+        < MIN_EMA_SEPARATION_PCT
+    ):
 
-            and
-
-            price
-            > candles[
-                i - 1
-            ]["high"]
-
-            and
-
-            candle["close"]
-            > candle["open"]
-        )
+        return False
 
     # ========================================================
-    # EMA MOMENTUM
+    # VWAP CONFIRMATION
+    # ========================================================
+
+    if (
+        price
+        <= vwap[i]
+    ):
+
+        return False
+
+    # ========================================================
+    # CANDLE BODY QUALITY
+    # ========================================================
+
+    candle_range = (
+
+        candle["high"]
+
+        - candle["low"]
+    )
+
+    if candle_range <= 0:
+
+        return False
+
+    body = abs(
+
+        candle["close"]
+
+        - candle["open"]
+    )
+
+    body_ratio = (
+
+        body
+
+        / candle_range
+    )
+
+    if (
+        body_ratio
+        < MIN_BODY_RATIO
+    ):
+
+        return False
+
+    # Must be bullish candle.
+
+    if (
+        candle["close"]
+        <= candle["open"]
+    ):
+
+        return False
+
+    # ========================================================
+    # CLOSE LOCATION
     #
-    # Fast EMA above slow EMA.
-    # Both rising.
-    # Close above previous high.
+    # Require close near high of candle.
     # ========================================================
 
-    if strategy_type == "EMA":
+    close_location = (
 
-        if i < 3:
-            return False
+        candle["close"]
+        - candle["low"]
 
-        return (
+    ) / candle_range
 
-            fast_ema[i]
-            > fast_ema[
-                i - 2
-            ]
+    if (
+        close_location
+        < MIN_CLOSE_LOCATION
+    ):
 
-            and
-
-            slow_ema[i]
-            > slow_ema[
-                i - 2
-            ]
-
-            and
-
-            price
-            > candles[
-                i - 1
-            ]["high"]
-
-            and
-
-            candle["close"]
-            > candle["open"]
-        )
+        return False
 
     # ========================================================
-    # OPENING RANGE BREAKOUT
+    # MOMENTUM BREAKOUT
     # ========================================================
 
-    if strategy_type == "ORB":
+    breakout_level = (
 
-        day = trading_date(
-            candle
+        previous["high"]
+
+        * (
+            1.0
+            + MIN_BREAKOUT_PCT
         )
+    )
 
-        opening_range = (
-            opening_ranges.get(
-                day
-            )
-        )
+    if (
+        price
+        <= breakout_level
+    ):
 
-        if not opening_range:
+        return False
 
-            return False
-
-        return (
-
-            price
-            > opening_range[
-                "high"
-            ]
-
-            and
-
-            price
-            > vwap[i]
-
-            and
-
-            candle["close"]
-            > candle["open"]
-        )
-
-    return False
+    return True
 
 
 # ============================================================
@@ -1043,7 +1043,6 @@ def signal_for_strategy(
 
 def backtest(
     candles,
-    strategy,
     fee_rate,
     slippage_rate,
 ):
@@ -1055,29 +1054,29 @@ def backtest(
         for candle in candles
     ]
 
-    fast_ema = ema(
+    fast = ema(
+
         closes,
+
         FAST_EMA,
     )
 
-    slow_ema = ema(
+    slow = ema(
+
         closes,
+
         SLOW_EMA,
     )
 
     atr_values = atr(
+
         candles,
+
         ATR_PERIOD,
     )
 
     vwap = (
         build_session_vwap(
-            candles
-        )
-    )
-
-    opening_ranges = (
-        build_opening_ranges(
             candles
         )
     )
@@ -1096,11 +1095,7 @@ def backtest(
 
     trades_today = 0
 
-    daily_start_equity = (
-        STARTING_CASH
-    )
-
-    daily_results = {}
+    cooldown = 0
 
     peak_equity = (
         STARTING_CASH
@@ -1108,8 +1103,16 @@ def backtest(
 
     max_drawdown = 0.0
 
+    daily_start_cash = (
+        STARTING_CASH
+    )
+
+    daily_results = {}
+
     start_index = max(
+
         SLOW_EMA + 5,
+
         ATR_PERIOD + 5,
     )
 
@@ -1122,37 +1125,58 @@ def backtest(
             candles[i]
         )
 
-        day = trading_date(
-            candle
+        day = (
+            trading_date(
+                candle
+            )
         )
 
         # ====================================================
-        # NEW TRADING DAY
+        # NEW DAY
         # ====================================================
 
-        if day != current_day:
+        if (
+            day
+            != current_day
+        ):
 
-            if current_day is not None:
+            if (
+                current_day
+                is not None
+            ):
 
                 daily_results[
                     current_day
                 ] = (
 
                     cash
-                    - daily_start_equity
+
+                    - daily_start_cash
                 )
 
             current_day = day
 
             trades_today = 0
 
-            daily_start_equity = (
+            cooldown = 0
+
+            pending = None
+
+            daily_start_cash = (
                 cash
             )
 
-            # There should never be an overnight position.
-            # Safety reset for research version.
-            pending = None
+        # ====================================================
+        # COOLDOWN
+        # ====================================================
+
+        if (
+            cooldown > 0
+            and
+            position is None
+        ):
+
+            cooldown -= 1
 
         # ====================================================
         # NEXT-CANDLE ENTRY
@@ -1164,8 +1188,6 @@ def backtest(
             position is None
         ):
 
-            # Never carry pending signals into a new day.
-
             if (
                 pending["day"]
                 != day
@@ -1176,16 +1198,6 @@ def backtest(
             elif (
                 trades_today
                 >= MAX_TRADES_PER_DAY
-            ):
-
-                pending = None
-
-            elif (
-                not before_time(
-                    candle,
-                    LAST_ENTRY_HOUR,
-                    LAST_ENTRY_MINUTE,
-                )
             ):
 
                 pending = None
@@ -1214,18 +1226,14 @@ def backtest(
 
                     atr_signal
 
-                    * strategy[
-                        "stop_atr"
-                    ]
+                    * STOP_ATR
                 )
 
                 target_distance = (
 
                     atr_signal
 
-                    * strategy[
-                        "target_atr"
-                    ]
+                    * TARGET_ATR
                 )
 
                 if (
@@ -1317,14 +1325,14 @@ def backtest(
                             "bars":
                                 0,
 
-                            "day":
-                                day,
-
                             "lowest":
                                 entry,
 
                             "highest":
                                 entry,
+
+                            "day":
+                                day,
                         }
 
                         trades_today += 1
@@ -1357,7 +1365,7 @@ def backtest(
 
             reason = None
 
-            # Gap below stop.
+            # Gap through stop.
 
             if (
                 candle["open"]
@@ -1372,7 +1380,7 @@ def backtest(
                     "GAP_STOP"
                 )
 
-            # Gap above target.
+            # Gap through target.
 
             elif (
                 candle["open"]
@@ -1403,8 +1411,7 @@ def backtest(
                     >= position["target"]
                 )
 
-                # Conservative assumption:
-                # stop first if both touched.
+                # Conservative same-bar assumption.
 
                 if stop_hit:
 
@@ -1422,15 +1429,13 @@ def backtest(
 
                     reason = "TARGET"
 
-            # Maximum holding period.
+            # Maximum hold.
 
             if (
                 raw_exit is None
                 and
                 position["bars"]
-                >= strategy[
-                    "max_hold"
-                ]
+                >= MAX_HOLD_BARS
             ):
 
                 raw_exit = (
@@ -1439,16 +1444,15 @@ def backtest(
 
                 reason = "TIME"
 
-            # Mandatory end-of-day liquidation.
+            # End-of-day exit.
 
             if (
                 raw_exit is None
                 and
-                after_time(
-                    candle,
-                    FORCE_EXIT_HOUR,
-                    FORCE_EXIT_MINUTE,
+                market_minute(
+                    candle
                 )
+                >= FORCE_EXIT_MINUTE
             ):
 
                 raw_exit = (
@@ -1518,6 +1522,7 @@ def backtest(
 
                     (
                         position["lowest"]
+
                         - position["entry"]
                     )
 
@@ -1530,6 +1535,7 @@ def backtest(
 
                     (
                         position["highest"]
+
                         - position["entry"]
                     )
 
@@ -1567,8 +1573,12 @@ def backtest(
 
                 position = None
 
+                cooldown = (
+                    COOLDOWN_BARS
+                )
+
         # ====================================================
-        # CREATE NEW SIGNAL
+        # NEW SIGNAL
         # ====================================================
 
         if (
@@ -1576,70 +1586,54 @@ def backtest(
             and
             pending is None
             and
+            cooldown == 0
+            and
             trades_today
             < MAX_TRADES_PER_DAY
             and
             i < len(candles) - 1
         ):
 
-            allowed_time = (
+            signal = (
+                valid_signal(
 
-                after_time(
-                    candle,
-                    TRADE_START_HOUR,
-                    TRADE_START_MINUTE,
-                )
+                    i,
 
-                and
+                    candles,
 
-                before_time(
-                    candle,
-                    LAST_ENTRY_HOUR,
-                    LAST_ENTRY_MINUTE,
+                    fast,
+
+                    slow,
+
+                    atr_values,
+
+                    vwap,
                 )
             )
 
-            if allowed_time:
+            if signal:
 
-                signal = (
-                    signal_for_strategy(
+                pending = {
 
-                        i,
+                    "atr":
+                        atr_values[i],
 
-                        candles,
-
-                        strategy,
-
-                        fast_ema,
-
-                        slow_ema,
-
-                        atr_values,
-
-                        vwap,
-
-                        opening_ranges,
-                    )
-                )
-
-                if signal:
-
-                    pending = {
-
-                        "atr":
-                            atr_values[i],
-
-                        "day":
-                            day,
-                    }
+                    "day":
+                        day,
+                }
 
         # ====================================================
         # EQUITY / DRAWDOWN
         # ====================================================
 
-        equity = cash
+        equity = (
+            cash
+        )
 
-        if position is not None:
+        if (
+            position
+            is not None
+        ):
 
             equity += (
 
@@ -1672,7 +1666,7 @@ def backtest(
             )
 
     # ========================================================
-    # SAFETY CLOSE AT END OF DATA
+    # END OF DATA SAFETY EXIT
     # ========================================================
 
     if position is not None:
@@ -1773,7 +1767,7 @@ def backtest(
 
             cash
 
-            - daily_start_equity
+            - daily_start_cash
         )
 
     return calculate_stats(
@@ -1796,8 +1790,8 @@ def calculate_stats(
     daily_results,
 ):
 
-    count = len(
-        trades
+    count = (
+        len(trades)
     )
 
     net = sum(
@@ -1839,8 +1833,8 @@ def calculate_stats(
         if x["net"] <= 0
     ]
 
-    gross_profit = sum(
-        winners
+    gross_profit = (
+        sum(winners)
     )
 
     gross_loss = abs(
@@ -1858,7 +1852,9 @@ def calculate_stats(
 
     elif gross_profit > 0:
 
-        pf = math.inf
+        pf = (
+            math.inf
+        )
 
     else:
 
@@ -1961,10 +1957,6 @@ def calculate_stats(
         else 0.0
     )
 
-    # ========================================================
-    # CONSECUTIVE LOSSES
-    # ========================================================
-
     max_consecutive_losses = 0
 
     current_losses = 0
@@ -1986,26 +1978,15 @@ def calculate_stats(
 
             current_losses = 0
 
-    # ========================================================
-    # DAILY RESULTS
-    # ========================================================
+    active_days = set(
 
-    active_days = {}
+        x["day"]
 
-    for trade in trades:
+        for x in trades
+    )
 
-        active_days[
-            trade["day"]
-        ] = (
-            active_days.get(
-                trade["day"],
-                0
-            )
-            + 1
-        )
-
-    trading_days = len(
-        active_days
+    trading_days = (
+        len(active_days)
     )
 
     trades_per_day = (
@@ -2159,15 +2140,15 @@ def pf_text(
 
 
 # ============================================================
-# CHRONOLOGICAL WINDOWS
+# FOUR WINDOWS
 # ============================================================
 
 def make_windows(
     candles
 ):
 
-    n = len(
-        candles
+    n = (
+        len(candles)
     )
 
     quarter = (
@@ -2213,18 +2194,12 @@ def make_windows(
 
 
 # ============================================================
-# TEST STRATEGIES
+# TEST
 # ============================================================
 
 def test_market(
     candles
 ):
-
-    windows = (
-        make_windows(
-            candles
-        )
-    )
 
     print()
 
@@ -2234,343 +2209,344 @@ def test_market(
 
     print(
         "^IXIC | "
-        "NASDAQ 5-MINUTE SCALPER V1"
+        "NASDAQ 5-MINUTE SCALPER V2"
     )
 
     print(
         "=" * 80
     )
 
-    for strategy in STRATEGIES:
+    print()
 
-        print()
+    print(
+        "SELECTIVE EMA + VWAP MOMENTUM"
+    )
 
-        print(
-            "#" * 80
+    print(
+
+        f"EMA: "
+        f"{FAST_EMA}/{SLOW_EMA}"
+    )
+
+    print(
+
+        f"Stop/Target: "
+        f"{STOP_ATR} / "
+        f"{TARGET_ATR} ATR"
+    )
+
+    print(
+
+        f"Maximum hold: "
+        f"{MAX_HOLD_BARS * 5} minutes"
+    )
+
+    print(
+
+        f"Maximum trades/day: "
+        f"{MAX_TRADES_PER_DAY}"
+    )
+
+    print(
+
+        f"Cooldown: "
+        f"{COOLDOWN_BARS * 5} minutes"
+    )
+
+    print()
+
+    print(
+        "ZERO-COST WINDOW TEST"
+    )
+
+    windows = (
+        make_windows(
+            candles
         )
+    )
 
-        print(
-            strategy["name"]
-        )
+    positive_windows = 0
 
-        print(
-            "#" * 80
-        )
+    total_window_trades = 0
 
-        print(
+    for (
+        name,
+        window,
+    ) in windows:
 
-            "Stop/Target: "
+        result = backtest(
 
-            f"{strategy['stop_atr']} / "
-
-            f"{strategy['target_atr']} ATR"
-        )
-
-        print(
-
-            "Max hold: "
-
-            f"{strategy['max_hold']} bars "
-
-            f"({strategy['max_hold'] * 5} minutes)"
-        )
-
-        print()
-
-        print(
-            "ZERO-COST WINDOW TEST"
-        )
-
-        positive_windows = 0
-
-        total_window_trades = 0
-
-        for (
-            name,
             window,
-        ) in windows:
 
-            result = backtest(
+            0.0,
 
-                window,
-
-                strategy,
-
-                0.0,
-
-                0.0,
-            )
-
-            total_window_trades += (
-                result["trades"]
-            )
-
-            if (
-                result["net"] > 0
-                and
-                result["pf"] > 1.0
-            ):
-
-                positive_windows += 1
-
-            print(
-
-                f"{name}: "
-
-                f"{result['return']:+.2f}% | "
-
-                f"{result['trades']} trades | "
-
-                f"PF "
-                f"{pf_text(result['pf'])} | "
-
-                f"Expect "
-                f"${result['expectancy']:+.3f}"
-            )
-
-        print(
-
-            "Positive windows: "
-
-            f"{positive_windows}/4"
+            0.0,
         )
 
-        print()
-
-        print(
-            "FULL-PERIOD FRICTION TEST"
+        total_window_trades += (
+            result["trades"]
         )
-
-        results = {}
-
-        for (
-            scenario,
-            costs,
-        ) in (
-            COST_SCENARIOS.items()
-        ):
-
-            result = backtest(
-
-                candles,
-
-                strategy,
-
-                costs["fee"],
-
-                costs["slippage"],
-            )
-
-            results[
-                scenario
-            ] = result
-
-            if (
-                result["net"] > 0
-                and
-                result["pf"] > 1.0
-                and
-                result["expectancy"] > 0
-            ):
-
-                status = "PASS"
-
-            else:
-
-                status = "FAIL"
-
-            print(
-
-                f"{scenario}: "
-
-                f"{status} | "
-
-                f"{result['return']:+.2f}% | "
-
-                f"{result['trades']} trades | "
-
-                f"Net "
-                f"${result['net']:+.2f} | "
-
-                f"PF "
-                f"{pf_text(result['pf'])} | "
-
-                f"Expect "
-                f"${result['expectancy']:+.3f}"
-            )
-
-        zero = (
-            results[
-                "ZERO COST"
-            ]
-        )
-
-        normal = (
-            results[
-                "NORMAL FRICTION"
-            ]
-        )
-
-        stress = (
-            results[
-                "STRESS FRICTION"
-            ]
-        )
-
-        print()
-
-        print(
-            "TRADE QUALITY"
-        )
-
-        print(
-
-            f"Starting cash: "
-            f"${STARTING_CASH:.2f}"
-        )
-
-        print(
-
-            f"Ending cash: "
-            f"${zero['ending_cash']:.2f}"
-        )
-
-        print(
-
-            f"Win rate: "
-            f"{zero['win_rate']:.1f}%"
-        )
-
-        print(
-
-            f"Average win: "
-            f"${zero['avg_win']:+.3f}"
-        )
-
-        print(
-
-            f"Average loss: "
-            f"${zero['avg_loss']:+.3f}"
-        )
-
-        print(
-
-            f"Payoff ratio: "
-            f"{zero['payoff']:.2f}"
-        )
-
-        print(
-
-            f"Average MAE: "
-            f"{zero['avg_mae']:+.3f}%"
-        )
-
-        print(
-
-            f"Average MFE: "
-            f"{zero['avg_mfe']:+.3f}%"
-        )
-
-        print(
-
-            f"Average hold: "
-            f"{zero['avg_bars'] * 5:.1f} "
-            f"minutes"
-        )
-
-        print(
-
-            f"Active trading days: "
-            f"{zero['trading_days']}"
-        )
-
-        print(
-
-            f"Trades/day: "
-            f"{zero['trades_per_day']:.2f}"
-        )
-
-        print(
-
-            f"Winning days: "
-            f"{zero['winning_days']}"
-        )
-
-        print(
-
-            f"Losing days: "
-            f"{zero['losing_days']}"
-        )
-
-        print(
-
-            f"Best day: "
-            f"${zero['best_day']:+.2f}"
-        )
-
-        print(
-
-            f"Worst day: "
-            f"${zero['worst_day']:+.2f}"
-        )
-
-        print(
-
-            f"Maximum consecutive losses: "
-            f"{zero['max_losses']}"
-        )
-
-        print(
-
-            f"Maximum drawdown: "
-            f"{zero['dd']:.2f}%"
-        )
-
-        print()
-
-        # ====================================================
-        # CLASSIFICATION
-        #
-        # For a scalper, surviving friction is mandatory.
-        # ====================================================
 
         if (
-            positive_windows >= 3
+            result["net"] > 0
             and
-            total_window_trades >= 100
-            and
-            normal["net"] > 0
-            and
-            normal["pf"] >= 1.20
-            and
-            normal["expectancy"] > 0
-            and
-            stress["net"] > 0
+            result["pf"] > 1.0
         ):
 
-            print(
-                "V1 RESULT: "
-                "SCALPING CANDIDATE"
-            )
+            positive_windows += 1
 
-        elif (
-            zero["net"] > 0
+        print(
+
+            f"{name}: "
+
+            f"{result['return']:+.2f}% | "
+
+            f"{result['trades']} trades | "
+
+            f"PF "
+            f"{pf_text(result['pf'])} | "
+
+            f"Expect "
+            f"${result['expectancy']:+.3f}"
+        )
+
+    print(
+
+        f"Positive windows: "
+        f"{positive_windows}/4"
+    )
+
+    print()
+
+    print(
+        "FULL-PERIOD FRICTION TEST"
+    )
+
+    results = {}
+
+    for (
+        name,
+        costs,
+    ) in (
+        COST_SCENARIOS.items()
+    ):
+
+        result = backtest(
+
+            candles,
+
+            costs["fee"],
+
+            costs["slippage"],
+        )
+
+        results[
+            name
+        ] = result
+
+        if (
+            result["net"] > 0
             and
-            zero["pf"] > 1.0
+            result["pf"] > 1.0
             and
-            positive_windows >= 2
+            result["expectancy"] > 0
         ):
 
-            print(
-                "V1 RESULT: "
-                "GROSS EDGE ONLY"
-            )
+            status = "PASS"
 
         else:
 
-            print(
-                "V1 RESULT: REJECT"
-            )
+            status = "FAIL"
+
+        print(
+
+            f"{name}: "
+
+            f"{status} | "
+
+            f"{result['return']:+.2f}% | "
+
+            f"{result['trades']} trades | "
+
+            f"Net "
+            f"${result['net']:+.2f} | "
+
+            f"PF "
+            f"{pf_text(result['pf'])} | "
+
+            f"Expect "
+            f"${result['expectancy']:+.3f}"
+        )
+
+    zero = (
+        results[
+            "ZERO COST"
+        ]
+    )
+
+    normal = (
+        results[
+            "NORMAL FRICTION"
+        ]
+    )
+
+    stress = (
+        results[
+            "STRESS FRICTION"
+        ]
+    )
+
+    print()
+
+    print(
+        "TRADE QUALITY"
+    )
+
+    print(
+
+        f"Starting cash: "
+        f"${STARTING_CASH:.2f}"
+    )
+
+    print(
+
+        f"Zero-cost ending cash: "
+        f"${zero['ending_cash']:.2f}"
+    )
+
+    print(
+
+        f"Win rate: "
+        f"{zero['win_rate']:.1f}%"
+    )
+
+    print(
+
+        f"Average win: "
+        f"${zero['avg_win']:+.3f}"
+    )
+
+    print(
+
+        f"Average loss: "
+        f"${zero['avg_loss']:+.3f}"
+    )
+
+    print(
+
+        f"Payoff ratio: "
+        f"{zero['payoff']:.2f}"
+    )
+
+    print(
+
+        f"Average MAE: "
+        f"{zero['avg_mae']:+.3f}%"
+    )
+
+    print(
+
+        f"Average MFE: "
+        f"{zero['avg_mfe']:+.3f}%"
+    )
+
+    print(
+
+        f"Average hold: "
+        f"{zero['avg_bars'] * 5:.1f} minutes"
+    )
+
+    print(
+
+        f"Active trading days: "
+        f"{zero['trading_days']}"
+    )
+
+    print(
+
+        f"Trades/day: "
+        f"{zero['trades_per_day']:.2f}"
+    )
+
+    print(
+
+        f"Winning days: "
+        f"{zero['winning_days']}"
+    )
+
+    print(
+
+        f"Losing days: "
+        f"{zero['losing_days']}"
+    )
+
+    print(
+
+        f"Best day: "
+        f"${zero['best_day']:+.2f}"
+    )
+
+    print(
+
+        f"Worst day: "
+        f"${zero['worst_day']:+.2f}"
+    )
+
+    print(
+
+        f"Maximum consecutive losses: "
+        f"{zero['max_losses']}"
+    )
+
+    print(
+
+        f"Maximum drawdown: "
+        f"{zero['dd']:.2f}%"
+    )
+
+    print()
+
+    # ========================================================
+    # V2 CLASSIFICATION
+    # ========================================================
+
+    if (
+        positive_windows >= 3
+        and
+        total_window_trades >= 50
+        and
+        normal["net"] > 0
+        and
+        normal["pf"] >= 1.20
+        and
+        normal["expectancy"] > 0
+        and
+        stress["net"] > 0
+    ):
+
+        print(
+            "V2 RESULT: "
+            "SCALPING CANDIDATE"
+        )
+
+    elif (
+        zero["net"] > 0
+        and
+        zero["pf"] > 1.0
+        and
+        positive_windows >= 2
+    ):
+
+        print(
+            "V2 RESULT: "
+            "GROSS EDGE ONLY"
+        )
+
+    else:
+
+        print(
+            "V2 RESULT: REJECT"
+        )
 
 
 # ============================================================
@@ -2580,11 +2556,11 @@ def test_market(
 def main():
 
     print(
-        "NASDAQ 5-MINUTE SCALPER V1"
+        "NASDAQ 5-MINUTE SCALPER V2"
     )
 
     print(
-        "INTRADAY DAY-TRADING TEST"
+        "SELECTIVE EMA + VWAP MOMENTUM"
     )
 
     print(
@@ -2601,35 +2577,53 @@ def main():
     )
 
     print(
-        f"Historical request: {RANGE}"
+
+        f"Historical request: "
+        f"{RANGE}"
     )
 
     print(
+
         f"Starting cash: "
         f"${STARTING_CASH:.2f}"
     )
 
     print(
+
         f"Risk per trade: "
         f"{RISK_PER_TRADE * 100:.1f}%"
     )
 
     print(
+
         f"Initial risk budget: "
         f"${STARTING_CASH * RISK_PER_TRADE:.2f}"
     )
 
     print(
+
         f"Maximum trades/day: "
         f"{MAX_TRADES_PER_DAY}"
     )
 
     print(
-        "No overnight positions"
+        "Morning + afternoon trading windows"
     )
 
     print(
-        "Next-candle execution"
+        "VWAP confirmation enabled"
+    )
+
+    print(
+        "EMA separation filter enabled"
+    )
+
+    print(
+        "Momentum candle quality filter enabled"
+    )
+
+    print(
+        "No overnight positions"
     )
 
     print(
