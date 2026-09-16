@@ -100,11 +100,11 @@ def get_history(client, product, days=DAYS_TO_TEST):
         # Use positional start/end values because some SDK versions
         # mishandle these values when sent as keyword arguments.
         response = client.get_public_candles(
-            product,
-            str(int(cursor.timestamp())),
-            str(int(chunk_end.timestamp())),
-            "FIVE_MINUTE",
-            300,
+            product_id=product,
+            start=int(cursor.timestamp()),
+            end=int(chunk_end.timestamp()),
+            granularity="FIVE_MINUTE",
+            limit=CANDLES_PER_REQUEST,
         )
 
         batch_number += 1
