@@ -3,6 +3,7 @@ import json
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from itertools import product
 
 import config
 
@@ -11,9 +12,27 @@ import config
 # SETTINGS
 # ============================================================
 
-DAYS_TO_TEST = 14
-GRANULARITY_SECONDS = 300       # 5-minute candles
-CANDLES_PER_REQUEST = 250       # safely below 300 max
+DAYS_TO_TEST = 30
+GRANULARITY_SECONDS = 300
+CANDLES_PER_REQUEST = 250
+
+# First 70% = optimization/training
+# Last 30% = validation
+TRAIN_RATIO = 0.70
+
+# Test combinations
+EMA_FAST_VALUES = [5, 9, 12]
+EMA_SLOW_VALUES = [18, 21, 30]
+
+RSI_MIN_VALUES = [35, 40, 45, 50]
+RSI_MAX_VALUES = [65, 70, 75, 80]
+
+VOLUME_MULTIPLIERS = [0.7, 0.9, 1.1]
+
+STOP_LOSS_VALUES = [0.008, 0.012, 0.016]
+TAKE_PROFIT_VALUES = [0.016, 0.024, 0.032]
+
+MIN_TRAIN_TRADES = 8
 
 
 # ============================================================
@@ -49,7 +68,6 @@ def rsi(values, period=14):
 
     for i in range(1, period + 1):
         change = values[i] - values[i - 1]
-
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
 
@@ -86,23 +104,23 @@ def rsi(values, period=14):
 
 
 # ============================================================
-# COINBASE EXCHANGE HISTORICAL DATA
+# COINBASE HISTORICAL DATA
 # ============================================================
 
 def iso_time(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def get_history(product, days=DAYS_TO_TEST):
-    end_time = datetime.now(timezone.utc)
+def get_history(product_name, days=DAYS_TO_TEST):
+    now = datetime.now(timezone.utc)
 
-    # Ignore the currently forming 5-minute candle.
     end_timestamp = (
-        int(end_time.timestamp())
+        int(now.timestamp())
         // GRANULARITY_SECONDS
         * GRANULARITY_SECONDS
     )
 
+    # Ignore currently-forming candle
     end_time = datetime.fromtimestamp(
         end_timestamp - GRANULARITY_SECONDS,
         timezone.utc
@@ -111,7 +129,6 @@ def get_history(product, days=DAYS_TO_TEST):
     start_time = end_time - timedelta(days=days)
 
     all_candles = {}
-
     cursor = start_time
     batch_number = 0
 
@@ -122,7 +139,7 @@ def get_history(product, days=DAYS_TO_TEST):
 
     print()
     print(
-        f"Downloading {days} days of {product} "
+        f"Downloading {days} days of {product_name} "
         f"from Coinbase Exchange..."
     )
 
@@ -139,47 +156,35 @@ def get_history(product, days=DAYS_TO_TEST):
         })
 
         url = (
-            f"https://api.exchange.coinbase.com/"
-            f"products/{product}/candles?{params}"
+            "https://api.exchange.coinbase.com/"
+            f"products/{product_name}/candles?{params}"
         )
 
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "coinbase-paper-backtester/1.0",
+                "User-Agent": "coinbase-paper-optimizer/1.0",
                 "Accept": "application/json",
             },
         )
 
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=30
-            ) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=30
+        ) as response:
 
-                raw_candles = json.loads(
-                    response.read().decode("utf-8")
-                )
-
-        except Exception as exc:
-            print(
-                f"Batch {batch_number + 1} "
-                f"download failed: {exc}"
+            raw = json.loads(
+                response.read().decode("utf-8")
             )
-            raise
+
+        if not isinstance(raw, list):
+            raise RuntimeError(
+                f"Unexpected Coinbase response: {raw}"
+            )
 
         batch_number += 1
 
-        if not isinstance(raw_candles, list):
-            raise RuntimeError(
-                f"Unexpected Coinbase response: "
-                f"{raw_candles}"
-            )
-
-        for c in raw_candles:
-            # Coinbase Exchange format:
-            # [time, low, high, open, close, volume]
-
+        for c in raw:
             if len(c) < 6:
                 continue
 
@@ -194,38 +199,13 @@ def get_history(product, days=DAYS_TO_TEST):
 
             all_candles[candle["time"]] = candle
 
-        if raw_candles:
-            times = [
-                int(c[0])
-                for c in raw_candles
-                if len(c) >= 6
-            ]
-
-            if times:
-                first = datetime.fromtimestamp(
-                    min(times),
-                    timezone.utc
-                )
-
-                last = datetime.fromtimestamp(
-                    max(times),
-                    timezone.utc
-                )
-
-                print(
-                    f"Batch {batch_number}: "
-                    f"{len(raw_candles)} candles | "
-                    f"{first} -> {last}"
-                )
-
-        else:
-            print(
-                f"Batch {batch_number}: 0 candles"
-            )
+        print(
+            f"Batch {batch_number}: "
+            f"{len(raw)} candles"
+        )
 
         cursor = chunk_end
-
-        time.sleep(0.25)
+        time.sleep(0.20)
 
     candles = list(all_candles.values())
 
@@ -234,52 +214,43 @@ def get_history(product, days=DAYS_TO_TEST):
     )
 
     print(
-        f"Total unique candles downloaded: "
-        f"{len(candles)}"
+        f"Total unique candles: {len(candles)}"
     )
-
-    if candles:
-        first = datetime.fromtimestamp(
-            candles[0]["time"],
-            timezone.utc
-        )
-
-        last = datetime.fromtimestamp(
-            candles[-1]["time"],
-            timezone.utc
-        )
-
-        print(
-            f"Actual data range: {first} -> {last}"
-        )
 
     return candles
 
 
 # ============================================================
-# BACKTEST
+# STRATEGY ENGINE
 # ============================================================
 
-def backtest(product, candles):
-    if len(candles) < 50:
-        print(
-            f"{product}: not enough candles."
-        )
-        return
+def run_strategy(
+    candles,
+    ema_fast_period,
+    ema_slow_period,
+    rsi_min,
+    rsi_max,
+    volume_multiplier,
+    stop_loss_pct,
+    take_profit_pct,
+):
+
+    if len(candles) < 100:
+        return None
 
     closes = [
         candle["close"]
         for candle in candles
     ]
 
-    fast_ema = ema(
+    fast = ema(
         closes,
-        config.EMA_FAST
+        ema_fast_period
     )
 
-    slow_ema = ema(
+    slow = ema(
         closes,
-        config.EMA_SLOW
+        ema_slow_period
     )
 
     rsi_values = rsi(
@@ -298,7 +269,7 @@ def backtest(product, candles):
     trades = []
 
     start_index = max(
-        config.EMA_SLOW + 2,
+        ema_slow_period + 2,
         config.VOLUME_LOOKBACK + 2,
         config.RSI_PERIOD + 2,
     )
@@ -311,12 +282,12 @@ def backtest(product, candles):
         price = candle["close"]
 
         # ====================================================
-        # EXIT EXISTING POSITION
+        # EXIT
         # ====================================================
 
         if position is not None:
             exit_price = None
-            exit_reason = None
+            reason = None
 
             stop_hit = (
                 candle["low"]
@@ -328,33 +299,26 @@ def backtest(product, candles):
                 >= position["target"]
             )
 
-            # Conservative assumption:
-            # if both are hit in one candle,
-            # assume the stop happened first.
-
             if stop_hit:
                 exit_price = position["stop"]
-                exit_reason = "STOP"
+                reason = "STOP"
 
             elif target_hit:
                 exit_price = position["target"]
-                exit_reason = "TARGET"
+                reason = "TARGET"
 
             if exit_price is not None:
-                gross_value = (
+                gross = (
                     position["qty"]
                     * exit_price
                 )
 
                 exit_fee = (
-                    gross_value
+                    gross
                     * config.FEE_RATE
                 )
 
-                cash += (
-                    gross_value
-                    - exit_fee
-                )
+                cash += gross - exit_fee
 
                 pnl = (
                     (
@@ -368,15 +332,13 @@ def backtest(product, candles):
 
                 trades.append({
                     "pnl": pnl,
-                    "reason": exit_reason,
-                    "entry": position["entry"],
-                    "exit": exit_price,
+                    "reason": reason,
                 })
 
                 position = None
 
         # ====================================================
-        # LOOK FOR NEW ENTRY
+        # ENTRY
         # ====================================================
 
         if position is None:
@@ -394,41 +356,32 @@ def backtest(product, candles):
             )
 
             signal = (
-                fast_ema[i] > slow_ema[i]
+                fast[i] > slow[i]
                 and
-                config.RSI_MIN
+                rsi_min
                 <= rsi_values[i]
-                <= config.RSI_MAX
+                <= rsi_max
                 and
                 candle["volume"]
-                >= (
-                    avg_volume
-                    * config.VOLUME_MULTIPLIER
-                )
+                >= avg_volume * volume_multiplier
                 and
                 candle["close"]
                 > candles[i - 1]["close"]
             )
 
             if signal:
-                stop_price = (
+                stop = (
                     price
-                    * (
-                        1
-                        - config.STOP_LOSS_PCT
-                    )
+                    * (1 - stop_loss_pct)
                 )
 
-                target_price = (
+                target = (
                     price
-                    * (
-                        1
-                        + config.TAKE_PROFIT_PCT
-                    )
+                    * (1 + take_profit_pct)
                 )
 
                 stop_distance = (
-                    price - stop_price
+                    price - stop
                 )
 
                 if stop_distance <= 0:
@@ -478,10 +431,7 @@ def backtest(product, candles):
                         cash
                         / (
                             price
-                            * (
-                                1
-                                + config.FEE_RATE
-                            )
+                            * (1 + config.FEE_RATE)
                         )
                     )
 
@@ -505,12 +455,12 @@ def backtest(product, candles):
                     "entry": price,
                     "qty": qty,
                     "entry_fee": entry_fee,
-                    "stop": stop_price,
-                    "target": target_price,
+                    "stop": stop,
+                    "target": target,
                 }
 
         # ====================================================
-        # EQUITY + DRAWDOWN
+        # DRAWDOWN
         # ====================================================
 
         equity = cash
@@ -535,28 +485,23 @@ def backtest(product, candles):
             )
 
     # ========================================================
-    # CLOSE ANY OPEN POSITION AT END
+    # CLOSE FINAL POSITION
     # ========================================================
 
     if position is not None:
-        final_price = (
-            candles[-1]["close"]
-        )
+        final_price = candles[-1]["close"]
 
-        gross_value = (
+        gross = (
             position["qty"]
             * final_price
         )
 
         exit_fee = (
-            gross_value
+            gross
             * config.FEE_RATE
         )
 
-        cash += (
-            gross_value
-            - exit_fee
-        )
+        cash += gross - exit_fee
 
         pnl = (
             (
@@ -571,13 +516,7 @@ def backtest(product, candles):
         trades.append({
             "pnl": pnl,
             "reason": "END",
-            "entry": position["entry"],
-            "exit": final_price,
         })
-
-    # ========================================================
-    # RESULTS
-    # ========================================================
 
     wins = sum(
         1
@@ -585,23 +524,16 @@ def backtest(product, candles):
         if trade["pnl"] > 0
     )
 
-    losses = sum(
-        1
-        for trade in trades
-        if trade["pnl"] <= 0
+    losses = (
+        len(trades) - wins
     )
 
-    targets = sum(
-        1
-        for trade in trades
-        if trade["reason"] == "TARGET"
-    )
-
-    stops = sum(
-        1
-        for trade in trades
-        if trade["reason"] == "STOP"
-    )
+    if trades:
+        win_rate = (
+            wins / len(trades) * 100
+        )
+    else:
+        win_rate = 0.0
 
     net_profit = (
         cash
@@ -614,71 +546,242 @@ def backtest(product, candles):
         * 100
     )
 
-    if trades:
-        win_rate = (
-            wins
-            / len(trades)
-            * 100
-        )
-    else:
-        win_rate = 0.0
+    return {
+        "ending_cash": cash,
+        "net_profit": net_profit,
+        "return_pct": return_pct,
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "max_drawdown": max_drawdown * 100,
+    }
+
+
+# ============================================================
+# OPTIMIZER
+# ============================================================
+
+def optimize(product_name, candles):
+
+    split_index = int(
+        len(candles) * TRAIN_RATIO
+    )
+
+    training = candles[:split_index]
+    validation = candles[split_index:]
 
     print()
-    print("=" * 55)
-    print(f"{product} BACKTEST RESULTS")
-    print("=" * 55)
+    print("=" * 65)
+    print(f"{product_name} OPTIMIZATION")
+    print("=" * 65)
 
     print(
-        f"Candles tested:    {len(candles)}"
+        f"Training candles:   {len(training)}"
     )
 
     print(
-        f"Trades:            {len(trades)}"
+        f"Validation candles: {len(validation)}"
+    )
+
+    combinations = list(
+        product(
+            EMA_FAST_VALUES,
+            EMA_SLOW_VALUES,
+            RSI_MIN_VALUES,
+            RSI_MAX_VALUES,
+            VOLUME_MULTIPLIERS,
+            STOP_LOSS_VALUES,
+            TAKE_PROFIT_VALUES,
+        )
+    )
+
+    # Remove impossible / poor structural combinations
+    combinations = [
+        combo
+        for combo in combinations
+        if combo[0] < combo[1]
+        and combo[2] < combo[3]
+    ]
+
+    print(
+        f"Strategy combinations: "
+        f"{len(combinations)}"
+    )
+
+    training_results = []
+
+    for number, combo in enumerate(
+        combinations,
+        start=1
+    ):
+        (
+            fast_period,
+            slow_period,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            stop_pct,
+            target_pct,
+        ) = combo
+
+        result = run_strategy(
+            training,
+            fast_period,
+            slow_period,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            stop_pct,
+            target_pct,
+        )
+
+        if (
+            result is not None
+            and
+            result["trades"] >= MIN_TRAIN_TRADES
+        ):
+            training_results.append({
+                "settings": combo,
+                "result": result,
+            })
+
+        if number % 500 == 0:
+            print(
+                f"Tested {number}/"
+                f"{len(combinations)} combinations..."
+            )
+
+    if not training_results:
+        print(
+            "No strategies met the minimum "
+            "trade requirement."
+        )
+        return
+
+    # Rank training candidates by return.
+    training_results.sort(
+        key=lambda x: x["result"]["return_pct"],
+        reverse=True
+    )
+
+    # Only validate the strongest training candidates.
+    finalists = training_results[:20]
+
+    validation_results = []
+
+    for candidate in finalists:
+        combo = candidate["settings"]
+
+        (
+            fast_period,
+            slow_period,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            stop_pct,
+            target_pct,
+        ) = combo
+
+        result = run_strategy(
+            validation,
+            fast_period,
+            slow_period,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            stop_pct,
+            target_pct,
+        )
+
+        if result is not None:
+            validation_results.append({
+                "settings": combo,
+                "train": candidate["result"],
+                "validation": result,
+            })
+
+    # Validation performance is what matters here.
+    validation_results.sort(
+        key=lambda x: (
+            x["validation"]["return_pct"],
+            -x["validation"]["max_drawdown"],
+        ),
+        reverse=True
+    )
+
+    print()
+    print(
+        "TOP VALIDATION RESULTS"
     )
 
     print(
-        f"Wins:              {wins}"
+        "These settings were selected using "
+        "training data, then tested separately."
     )
 
-    print(
-        f"Losses:            {losses}"
-    )
+    print()
 
-    print(
-        f"Win rate:          {win_rate:.2f}%"
-    )
+    for rank, candidate in enumerate(
+        validation_results[:5],
+        start=1
+    ):
+        (
+            fast_period,
+            slow_period,
+            rsi_min,
+            rsi_max,
+            volume_mult,
+            stop_pct,
+            target_pct,
+        ) = candidate["settings"]
 
-    print(
-        f"Targets hit:       {targets}"
-    )
+        train = candidate["train"]
+        test = candidate["validation"]
 
-    print(
-        f"Stops hit:         {stops}"
-    )
+        print("-" * 65)
+        print(f"CANDIDATE {rank}")
 
-    print(
-        f"Starting cash:     "
-        f"${config.STARTING_CASH:,.2f}"
-    )
+        print(
+            f"EMA: {fast_period}/{slow_period}"
+        )
 
-    print(
-        f"Ending cash:       "
-        f"${cash:,.2f}"
-    )
+        print(
+            f"RSI: {rsi_min}-{rsi_max}"
+        )
 
-    print(
-        f"Net P/L:           "
-        f"${net_profit:,.2f}"
-    )
+        print(
+            f"Volume multiplier: {volume_mult}"
+        )
 
-    print(
-        f"Return:            "
-        f"{return_pct:.2f}%"
-    )
+        print(
+            f"Stop loss: {stop_pct * 100:.2f}%"
+        )
 
+        print(
+            f"Take profit: {target_pct * 100:.2f}%"
+        )
+
+        print(
+            f"TRAIN -> "
+            f"Return {train['return_pct']:.2f}% | "
+            f"Trades {train['trades']} | "
+            f"Win {train['win_rate']:.1f}% | "
+            f"DD {train['max_drawdown']:.2f}%"
+        )
+
+        print(
+            f"VALID -> "
+            f"Return {test['return_pct']:.2f}% | "
+            f"Trades {test['trades']} | "
+            f"Win {test['win_rate']:.1f}% | "
+            f"DD {test['max_drawdown']:.2f}%"
+        )
+
+    print()
     print(
-        f"Max drawdown:      "
-        f"{max_drawdown * 100:.2f}%"
+        "IMPORTANT: A positive backtest does not "
+        "guarantee future profit."
     )
 
 
@@ -687,8 +790,9 @@ def backtest(product, candles):
 # ============================================================
 
 def main():
+
     print(
-        "BTC/ETH STRATEGY BACKTEST"
+        "BTC/ETH STRATEGY OPTIMIZER"
     )
 
     print(
@@ -696,28 +800,32 @@ def main():
     )
 
     print(
-        "Historical data source: "
-        "Coinbase Exchange"
+        "Historical data: Coinbase Exchange"
     )
 
     print(
-        f"Test period: {DAYS_TO_TEST} days"
+        f"Testing {DAYS_TO_TEST} days"
     )
 
-    for product in config.PRODUCTS:
+    print(
+        "70% training / 30% validation"
+    )
+
+    for product_name in config.PRODUCTS:
+
         try:
             candles = get_history(
-                product
+                product_name
             )
 
-            backtest(
-                product,
+            optimize(
+                product_name,
                 candles
             )
 
         except Exception as exc:
             print(
-                f"{product} ERROR: "
+                f"{product_name} ERROR: "
                 f"{type(exc).__name__}: {exc}"
             )
 
