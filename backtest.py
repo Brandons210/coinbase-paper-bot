@@ -10,59 +10,58 @@ import config
 
 
 # ============================================================
-# V4 — 1 HOUR SWING STRATEGY
+# V5 — BREAKOUT / VOLATILITY EXPANSION
+# PAPER + BACKTEST ONLY
 # ============================================================
 
 DAYS_TO_TEST = 365
 
-# Coinbase Exchange supports 1-hour candles.
+# 1-hour execution candles
 GRANULARITY_SECONDS = 3600
 CANDLES_PER_REQUEST = 250
 
 STARTING_CASH = float(config.STARTING_CASH)
 
-# PAPER/BACKTEST ONLY
 RISK_PER_TRADE = 0.01
 MAX_POSITION_PCT = 0.30
 
-# Keep both assumptions separate.
-FEE_MODELS = {
-    "TAKER": 0.006,
-    "MAKER": 0.004,
-}
+ATR_PERIOD = 14
+VOLUME_LOOKBACK = 20
 
-# 60% train / 20% validation / 20% untouched holdout
+# 60 / 20 / 20 chronological split
 TRAIN_RATIO = 0.60
 VALIDATION_RATIO = 0.20
-
-ATR_PERIOD = 14
-RSI_PERIOD = 14
-VOLUME_LOOKBACK = 20
 
 MIN_TRAIN_TRADES = 8
 FINALISTS = 20
 
 
 # ============================================================
-# PARAMETER GRID
+# IMPORTANT:
+# Stage 1 tests GROSS EDGE with ZERO fees.
 #
-# Intentionally small. We don't want thousands of combinations
-# mining one historical period for a lucky result.
+# Only if a setup survives holdout gross-positive should we
+# move it into a separate realistic fee/slippage test.
 # ============================================================
 
-FAST_EMAS = [12, 20]
-SLOW_EMAS = [40, 50]
+FEE_RATE = 0.0
 
-RSI_MINS = [45, 50]
 
-VOLUME_MULTS = [0.8, 1.0]
+# ============================================================
+# PARAMETER GRID
+# ============================================================
 
-ATR_STOP_MULTS = [2.0, 2.5]
+BREAKOUT_LOOKBACKS = [12, 24, 48]
+TREND_EMAS = [50, 100]
 
-ATR_TARGET_MULTS = [4.0, 6.0]
+VOLUME_MULTS = [0.8, 1.0, 1.2]
 
-TRAIL_START_MULTS = [2.0, 3.0]
-TRAIL_DISTANCE_MULTS = [1.5, 2.0]
+ATR_STOP_MULTS = [1.5, 2.0, 2.5]
+
+ATR_TARGET_MULTS = [3.0, 4.0, 6.0]
+
+# Exit if no target/stop after this many hours.
+MAX_HOLD_BARS = [24, 48, 72]
 
 
 # ============================================================
@@ -89,55 +88,6 @@ def ema(values, period):
     return output
 
 
-def rsi(values, period=14):
-    output = [50.0] * len(values)
-
-    if len(values) <= period:
-        return output
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        change = values[i] - values[i - 1]
-
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    if avg_loss == 0:
-        output[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        output[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period + 1, len(values)):
-        change = values[i] - values[i - 1]
-
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
-
-        avg_gain = (
-            avg_gain * (period - 1)
-            + gain
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1)
-            + loss
-        ) / period
-
-        if avg_loss == 0:
-            output[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            output[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    return output
-
-
 def atr(candles, period=14):
     output = [0.0] * len(candles)
     true_ranges = [0.0] * len(candles)
@@ -145,7 +95,10 @@ def atr(candles, period=14):
     for i in range(1, len(candles)):
         high = candles[i]["high"]
         low = candles[i]["low"]
-        previous_close = candles[i - 1]["close"]
+
+        previous_close = (
+            candles[i - 1]["close"]
+        )
 
         true_ranges[i] = max(
             high - low,
@@ -163,7 +116,10 @@ def atr(candles, period=14):
 
     output[period] = current
 
-    for i in range(period + 1, len(candles)):
+    for i in range(
+        period + 1,
+        len(candles)
+    ):
         current = (
             current * (period - 1)
             + true_ranges[i]
@@ -175,11 +131,13 @@ def atr(candles, period=14):
 
 
 # ============================================================
-# COINBASE HISTORICAL DATA
+# COINBASE DATA
 # ============================================================
 
 def iso_time(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def get_history(product_name):
@@ -191,7 +149,6 @@ def get_history(product_name):
         * GRANULARITY_SECONDS
     )
 
-    # Last fully completed candle.
     end_time = datetime.fromtimestamp(
         end_timestamp - GRANULARITY_SECONDS,
         timezone.utc,
@@ -220,14 +177,18 @@ def get_history(product_name):
 
     while cursor < end_time:
         chunk_end = min(
-            cursor + timedelta(seconds=chunk_seconds),
+            cursor
+            + timedelta(
+                seconds=chunk_seconds
+            ),
             end_time,
         )
 
         params = urllib.parse.urlencode({
             "start": iso_time(cursor),
             "end": iso_time(chunk_end),
-            "granularity": GRANULARITY_SECONDS,
+            "granularity":
+                GRANULARITY_SECONDS,
         })
 
         url = (
@@ -239,8 +200,10 @@ def get_history(product_name):
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "coinbase-v4-paper-backtest/1.0",
-                "Accept": "application/json",
+                "User-Agent":
+                    "coinbase-v5-backtest/1.0",
+                "Accept":
+                    "application/json",
             },
         )
 
@@ -250,12 +213,14 @@ def get_history(product_name):
         ) as response:
 
             raw = json.loads(
-                response.read().decode("utf-8")
+                response
+                .read()
+                .decode("utf-8")
             )
 
         if not isinstance(raw, list):
             raise RuntimeError(
-                f"Unexpected Coinbase response: {raw}"
+                f"Unexpected response: {raw}"
             )
 
         for c in raw:
@@ -271,28 +236,33 @@ def get_history(product_name):
                 "volume": float(c[5]),
             }
 
-            all_candles[candle["time"]] = candle
+            all_candles[
+                candle["time"]
+            ] = candle
 
         batches += 1
 
         if batches % 5 == 0:
             print(
-                f"Downloaded {batches} batches..."
+                f"Downloaded "
+                f"{batches} batches..."
             )
 
         cursor = chunk_end
 
-        # Be polite to the public endpoint.
         time.sleep(0.20)
 
-    candles = list(all_candles.values())
+    candles = list(
+        all_candles.values()
+    )
 
     candles.sort(
         key=lambda x: x["time"]
     )
 
     print(
-        f"Total unique candles: {len(candles)}"
+        f"Total unique candles: "
+        f"{len(candles)}"
     )
 
     if candles:
@@ -314,21 +284,19 @@ def get_history(product_name):
 
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST
 # ============================================================
 
 def run_strategy(
     candles,
-    fee_rate,
-    fast_period,
-    slow_period,
-    rsi_min,
+    breakout_lookback,
+    trend_period,
     volume_mult,
     atr_stop_mult,
     atr_target_mult,
-    trail_start_mult,
-    trail_distance_mult,
+    max_hold_bars,
 ):
+
     if len(candles) < 300:
         return None
 
@@ -337,19 +305,9 @@ def run_strategy(
         for candle in candles
     ]
 
-    fast = ema(
+    trend = ema(
         closes,
-        fast_period
-    )
-
-    slow = ema(
-        closes,
-        slow_period
-    )
-
-    rsi_values = rsi(
-        closes,
-        RSI_PERIOD
+        trend_period
     )
 
     atr_values = atr(
@@ -368,10 +326,10 @@ def run_strategy(
     max_drawdown = 0.0
 
     start_index = max(
-        slow_period + 5,
+        breakout_lookback + 5,
+        trend_period + 5,
         VOLUME_LOOKBACK + 5,
         ATR_PERIOD + 5,
-        RSI_PERIOD + 5,
     )
 
     for i in range(
@@ -381,7 +339,7 @@ def run_strategy(
         candle = candles[i]
 
         # ====================================================
-        # EXECUTE PREVIOUS SIGNAL AT CURRENT OPEN
+        # NEXT-BAR ENTRY
         # ====================================================
 
         if (
@@ -390,7 +348,9 @@ def run_strategy(
         ):
             entry_price = candle["open"]
 
-            atr_at_signal = pending_entry["atr"]
+            atr_at_signal = (
+                pending_entry["atr"]
+            )
 
             stop_distance = (
                 atr_at_signal
@@ -405,7 +365,6 @@ def run_strategy(
             if (
                 entry_price > 0
                 and stop_distance > 0
-                and target_distance > 0
             ):
                 risk_dollars = (
                     cash
@@ -433,79 +392,36 @@ def run_strategy(
                         qty * entry_price
                     )
 
-                    entry_fee = (
-                        entry_value
-                        * fee_rate
-                    )
-
-                    total_entry_cost = (
-                        entry_value
-                        + entry_fee
-                    )
-
-                    if total_entry_cost <= cash:
-                        cash -= total_entry_cost
+                    if entry_value <= cash:
+                        cash -= entry_value
 
                         position = {
-                            "entry": entry_price,
-                            "qty": qty,
-                            "entry_fee": entry_fee,
-                            "initial_atr": atr_at_signal,
+                            "entry":
+                                entry_price,
+
+                            "qty":
+                                qty,
+
                             "stop":
                                 entry_price
                                 - stop_distance,
+
                             "target":
                                 entry_price
                                 + target_distance,
-                            "highest":
-                                entry_price,
-                            "trailing_active":
-                                False,
+
+                            "bars_held":
+                                0,
                         }
 
             pending_entry = None
 
         # ====================================================
-        # MANAGE OPEN POSITION
+        # POSITION MANAGEMENT
         # ====================================================
 
         if position is not None:
-            # Track highest price reached.
-            position["highest"] = max(
-                position["highest"],
-                candle["high"],
-            )
-
-            # Activate trailing stop only after the trade
-            # has moved substantially in our favor.
-            trail_trigger_price = (
-                position["entry"]
-                + (
-                    position["initial_atr"]
-                    * trail_start_mult
-                )
-            )
-
-            if (
-                position["highest"]
-                >= trail_trigger_price
-            ):
-                position["trailing_active"] = True
-
-            # Ratchet trailing stop upward only.
-            if position["trailing_active"]:
-                proposed_trail = (
-                    position["highest"]
-                    - (
-                        position["initial_atr"]
-                        * trail_distance_mult
-                    )
-                )
-
-                position["stop"] = max(
-                    position["stop"],
-                    proposed_trail,
-                )
+            position["bars_held"] += 1
 
             stop_hit = (
                 candle["low"]
@@ -520,29 +436,35 @@ def run_strategy(
             exit_price = None
             reason = None
 
-            # Conservative same-candle assumption:
-            # if both are touched, count the stop first.
+            # Conservative if both occur in same hourly bar.
             if stop_hit:
-                exit_price = position["stop"]
+                exit_price = (
+                    position["stop"]
+                )
 
-                if position["trailing_active"]:
-                    reason = "TRAIL"
-                else:
-                    reason = "STOP"
+                reason = "STOP"
 
             elif target_hit:
-                exit_price = position["target"]
+                exit_price = (
+                    position["target"]
+                )
+
                 reason = "TARGET"
+
+            elif (
+                position["bars_held"]
+                >= max_hold_bars
+            ):
+                exit_price = (
+                    candle["close"]
+                )
+
+                reason = "TIME"
 
             if exit_price is not None:
                 exit_value = (
                     position["qty"]
                     * exit_price
-                )
-
-                exit_fee = (
-                    exit_value
-                    * fee_rate
                 )
 
                 gross_pnl = (
@@ -553,32 +475,17 @@ def run_strategy(
                     * position["qty"]
                 )
 
-                total_fees = (
-                    position["entry_fee"]
-                    + exit_fee
-                )
-
-                net_pnl = (
-                    gross_pnl
-                    - total_fees
-                )
-
-                cash += (
-                    exit_value
-                    - exit_fee
-                )
+                cash += exit_value
 
                 trades.append({
-                    "gross": gross_pnl,
-                    "fees": total_fees,
-                    "net": net_pnl,
+                    "pnl": gross_pnl,
                     "reason": reason,
                 })
 
                 position = None
 
         # ====================================================
-        # SIGNAL
+        # BREAKOUT SIGNAL
         # ====================================================
 
         if (
@@ -588,13 +495,25 @@ def run_strategy(
         ):
             price = candle["close"]
 
-            current_atr = atr_values[i]
+            current_atr = (
+                atr_values[i]
+            )
 
             if (
                 price <= 0
                 or current_atr <= 0
             ):
                 continue
+
+            # Highest HIGH of PREVIOUS candles.
+            # Current candle is deliberately excluded.
+            prior_high = max(
+                candles[j]["high"]
+                for j in range(
+                    i - breakout_lookback,
+                    i,
+                )
+            )
 
             volume_window = [
                 candles[j]["volume"]
@@ -610,106 +529,61 @@ def run_strategy(
             )
 
             # ----------------------------------------------
-            # PRIMARY TREND
+            # HIGHER-TIMEFRAME-LIKE REGIME
+            #
+            # We're using a much slower hourly EMA as a
+            # regime filter instead of another crossover.
             # ----------------------------------------------
 
             trend_ok = (
-                fast[i] > slow[i]
+                price > trend[i]
                 and
-                price > slow[i]
-            )
-
-            # Require both averages to be rising.
-            slope_ok = (
-                fast[i] > fast[i - 3]
-                and
-                slow[i] > slow[i - 3]
+                trend[i] > trend[i - 6]
             )
 
             # ----------------------------------------------
-            # PULLBACK / RECLAIM
-            #
-            # Price briefly comes back toward the fast EMA,
-            # then closes back above it while the larger
-            # trend remains bullish.
+            # TRUE BREAKOUT
             # ----------------------------------------------
 
-            reclaim = (
-                closes[i - 1]
-                <= fast[i - 1] * 1.002
-                and
-                closes[i]
-                > fast[i]
-            )
-
-            # Also allow a fresh fast/slow crossover.
-            crossover = (
-                fast[i - 1]
-                <= slow[i - 1]
-                and
-                fast[i]
-                > slow[i]
-            )
-
-            trigger_ok = (
-                reclaim
-                or crossover
+            breakout_ok = (
+                price > prior_high
             )
 
             # ----------------------------------------------
-            # MOMENTUM
-            # ----------------------------------------------
-
-            momentum_ok = (
-                rsi_values[i] >= rsi_min
-                and
-                rsi_values[i] <= 72
-            )
-
-            # ----------------------------------------------
-            # VOLUME
+            # VOLUME EXPANSION
             # ----------------------------------------------
 
             volume_ok = (
                 candle["volume"]
-                >= avg_volume * volume_mult
+                >= avg_volume
+                * volume_mult
             )
 
             # ----------------------------------------------
-            # FEE-AWARE MOVE SIZE
+            # VOLATILITY FILTER
             #
-            # Don't enter unless the planned target is
-            # comfortably larger than round-trip fees.
+            # Avoid extremely dead conditions.
             # ----------------------------------------------
 
-            projected_target_pct = (
-                current_atr
-                * atr_target_mult
-                / price
+            atr_pct = (
+                current_atr / price
             )
 
-            round_trip_fee_pct = (
-                fee_rate * 2.0
-            )
-
-            fee_ok = (
-                projected_target_pct
-                >= round_trip_fee_pct
-                + 0.005
+            volatility_ok = (
+                atr_pct >= 0.003
             )
 
             signal = (
                 trend_ok
-                and slope_ok
-                and trigger_ok
-                and momentum_ok
+                and breakout_ok
                 and volume_ok
-                and fee_ok
+                and volatility_ok
             )
 
             if signal:
                 pending_entry = {
-                    "atr": current_atr
+                    "atr":
+                        current_atr
                 }
 
         # ====================================================
@@ -741,23 +615,20 @@ def run_strategy(
             )
 
     # ========================================================
-    # CLOSE POSITION AT END OF WINDOW
+    # CLOSE AT END OF TEST WINDOW
     # ========================================================
 
     if position is not None:
-        final_price = candles[-1]["close"]
+        final_price = (
+            candles[-1]["close"]
+        )
 
         exit_value = (
             position["qty"]
             * final_price
         )
 
-        exit_fee = (
-            exit_value
-            * fee_rate
-        )
-
-        gross_pnl = (
+        pnl = (
             (
                 final_price
                 - position["entry"]
@@ -765,25 +636,10 @@ def run_strategy(
             * position["qty"]
         )
 
-        total_fees = (
-            position["entry_fee"]
-            + exit_fee
-        )
-
-        net_pnl = (
-            gross_pnl
-            - total_fees
-        )
-
-        cash += (
-            exit_value
-            - exit_fee
-        )
+        cash += exit_value
 
         trades.append({
-            "gross": gross_pnl,
-            "fees": total_fees,
-            "net": net_pnl,
+            "pnl": pnl,
             "reason": "END",
         })
 
@@ -794,52 +650,37 @@ def run_strategy(
 
 
 # ============================================================
-# PERFORMANCE STATISTICS
+# STATISTICS
 # ============================================================
 
 def calculate_results(
     trades,
     max_drawdown,
 ):
-    trade_count = len(trades)
 
-    total_gross = sum(
-        trade["gross"]
-        for trade in trades
-    )
+    count = len(trades)
 
-    total_fees = sum(
-        trade["fees"]
-        for trade in trades
-    )
-
-    total_net = sum(
-        trade["net"]
+    total_pnl = sum(
+        trade["pnl"]
         for trade in trades
     )
 
     winners = [
-        trade
+        trade["pnl"]
         for trade in trades
-        if trade["net"] > 0
+        if trade["pnl"] > 0
     ]
 
     losers = [
-        trade
+        trade["pnl"]
         for trade in trades
-        if trade["net"] <= 0
+        if trade["pnl"] <= 0
     ]
 
-    gross_profit = sum(
-        trade["net"]
-        for trade in winners
-    )
+    gross_profit = sum(winners)
 
     gross_loss = abs(
-        sum(
-            trade["net"]
-            for trade in losers
-        )
+        sum(losers)
     )
 
     if gross_loss > 0:
@@ -847,47 +688,41 @@ def calculate_results(
             gross_profit
             / gross_loss
         )
+
     elif gross_profit > 0:
         profit_factor = math.inf
+
     else:
         profit_factor = 0.0
 
-    if winners:
-        average_winner = (
-            sum(
-                trade["net"]
-                for trade in winners
-            )
-            / len(winners)
-        )
-    else:
-        average_winner = 0.0
+    win_rate = (
+        len(winners)
+        / count
+        * 100.0
+        if count
+        else 0.0
+    )
 
-    if losers:
-        average_loser = (
-            sum(
-                trade["net"]
-                for trade in losers
-            )
-            / len(losers)
-        )
-    else:
-        average_loser = 0.0
+    avg_winner = (
+        sum(winners)
+        / len(winners)
+        if winners
+        else 0.0
+    )
 
-    if trade_count:
-        win_rate = (
-            len(winners)
-            / trade_count
-            * 100.0
-        )
+    avg_loser = (
+        sum(losers)
+        / len(losers)
+        if losers
+        else 0.0
+    )
 
-        expectancy = (
-            total_net
-            / trade_count
-        )
-    else:
-        win_rate = 0.0
-        expectancy = 0.0
+    expectancy = (
+        total_pnl
+        / count
+        if count
+        else 0.0
+    )
 
     targets = sum(
         1
@@ -901,24 +736,23 @@ def calculate_results(
         if trade["reason"] == "STOP"
     )
 
-    trails = sum(
+    time_exits = sum(
         1
         for trade in trades
-        if trade["reason"] == "TRAIL"
+        if trade["reason"] == "TIME"
     )
 
     return {
-        "trades": trade_count,
-        "wins": len(winners),
-        "losses": len(losers),
-        "win_rate": win_rate,
+        "trades": count,
 
-        "gross": total_gross,
-        "fees": total_fees,
-        "net": total_net,
+        "win_rate":
+            win_rate,
+
+        "pnl":
+            total_pnl,
 
         "return_pct":
-            total_net
+            total_pnl
             / STARTING_CASH
             * 100.0,
 
@@ -929,18 +763,23 @@ def calculate_results(
         "profit_factor":
             profit_factor,
 
-        "average_winner":
-            average_winner,
+        "avg_winner":
+            avg_winner,
 
-        "average_loser":
-            average_loser,
+        "avg_loser":
+            avg_loser,
 
         "expectancy":
             expectancy,
 
-        "targets": targets,
-        "stops": stops,
-        "trails": trails,
+        "targets":
+            targets,
+
+        "stops":
+            stops,
+
+        "time_exits":
+            time_exits,
     }
 
 
@@ -948,31 +787,52 @@ def calculate_results(
 # SCORING
 # ============================================================
 
-def score_result(result):
-    # Require actual activity.
+def score(result):
     if result["trades"] == 0:
         return -999999.0
 
-    # Return rewarded, drawdown penalized.
     return (
         result["return_pct"]
-        - (
-            result["drawdown"]
-            * 0.50
-        )
+        - result["drawdown"] * 0.50
     )
 
 
 # ============================================================
-# TRAIN -> VALIDATE -> UNTOUCHED HOLDOUT
+# OUTPUT
+# ============================================================
+
+def pf_text(value):
+    if math.isinf(value):
+        return "INF"
+
+    return f"{value:.2f}"
+
+
+def print_result(
+    label,
+    result,
+):
+
+    print(
+        f"{label} -> "
+        f"{result['return_pct']:+.2f}% | "
+        f"{result['trades']} trades | "
+        f"{result['win_rate']:.1f}% win | "
+        f"DD {result['drawdown']:.2f}% | "
+        f"PF {pf_text(result['profit_factor'])} | "
+        f"Expect ${result['expectancy']:+.2f}"
+    )
+
+
+# ============================================================
+# TRAIN -> VALIDATE -> HOLDOUT
 # ============================================================
 
 def optimize(
     product_name,
     candles,
-    fee_name,
-    fee_rate,
 ):
+
     train_end = int(
         len(candles)
         * TRAIN_RATIO
@@ -986,50 +846,43 @@ def optimize(
         )
     )
 
-    training = candles[:train_end]
+    training = (
+        candles[:train_end]
+    )
 
-    validation = candles[
-        train_end:
-        validation_end
-    ]
+    validation = (
+        candles[
+            train_end:
+            validation_end
+        ]
+    )
 
-    holdout = candles[
-        validation_end:
-    ]
+    holdout = (
+        candles[
+            validation_end:
+        ]
+    )
 
     combinations = list(
         product(
-            FAST_EMAS,
-            SLOW_EMAS,
-            RSI_MINS,
+            BREAKOUT_LOOKBACKS,
+            TREND_EMAS,
             VOLUME_MULTS,
             ATR_STOP_MULTS,
             ATR_TARGET_MULTS,
-            TRAIL_START_MULTS,
-            TRAIL_DISTANCE_MULTS,
+            MAX_HOLD_BARS,
         )
     )
 
-    combinations = [
-        combo
-        for combo in combinations
-        if combo[0] < combo[1]
-    ]
-
     print()
-    print("=" * 76)
+    print("=" * 78)
 
     print(
         f"{product_name} | "
-        f"{fee_name} FEE MODEL"
+        f"V5 GROSS-EDGE TEST"
     )
 
-    print("=" * 76)
-
-    print(
-        f"Fee per side: "
-        f"{fee_rate * 100:.2f}%"
-    )
+    print("=" * 78)
 
     print(
         f"Training candles: "
@@ -1051,6 +904,10 @@ def optimize(
         f"{len(combinations)}"
     )
 
+    print(
+        "Fees: $0.00 for Stage 1"
+    )
+
     # ========================================================
     # TRAIN
     # ========================================================
@@ -1060,7 +917,6 @@ def optimize(
     for combo in combinations:
         result = run_strategy(
             training,
-            fee_rate,
             *combo,
         )
 
@@ -1070,43 +926,46 @@ def optimize(
             >= MIN_TRAIN_TRADES
         ):
             trained.append({
-                "settings": combo,
-                "train": result,
+                "settings":
+                    combo,
+
+                "train":
+                    result,
             })
 
     if not trained:
         print(
-            "No strategies produced enough "
-            "training trades."
+            "No strategies produced "
+            "enough training trades."
         )
+
         return
 
     trained.sort(
         key=lambda item:
-            score_result(
-                item["train"]
-            ),
+            score(item["train"]),
         reverse=True,
     )
 
     # ========================================================
-    # VALIDATE TRAINING FINALISTS
+    # VALIDATION
     # ========================================================
 
     validated = []
 
-    for candidate in trained[:FINALISTS]:
+    for candidate in trained[
+        :FINALISTS
+    ]:
+
         result = run_strategy(
             validation,
-            fee_rate,
             *candidate["settings"],
         )
 
-        if result is None:
-            continue
-
-        # Require at least some independent activity.
-        if result["trades"] < 2:
+        if (
+            result is None
+            or result["trades"] < 3
+        ):
             continue
 
         validated.append({
@@ -1125,13 +984,12 @@ def optimize(
             "No finalists produced enough "
             "validation trades."
         )
+
         return
 
-    # Selection ends HERE.
-    # Holdout data is not used for selection.
     validated.sort(
         key=lambda item:
-            score_result(
+            score(
                 item["validation"]
             ),
         reverse=True,
@@ -1140,50 +998,46 @@ def optimize(
     selected = validated[0]
 
     # ========================================================
-    # ONE FINAL HOLDOUT TEST
+    # UNTOUCHED HOLDOUT
     # ========================================================
 
-    holdout_result = run_strategy(
+    final = run_strategy(
         holdout,
-        fee_rate,
         *selected["settings"],
     )
 
     (
-        fast,
-        slow,
-        rsi_min,
+        breakout_lookback,
+        trend_period,
         volume_mult,
         atr_stop,
         atr_target,
-        trail_start,
-        trail_distance,
+        max_hold,
     ) = selected["settings"]
 
     train = selected["train"]
     valid = selected["validation"]
-    final = holdout_result
 
     print()
     print(
         "SELECTED BEFORE HOLDOUT"
     )
 
-    print("-" * 76)
+    print("-" * 78)
 
     print(
-        f"EMA fast/slow: "
-        f"{fast}/{slow}"
+        f"Breakout lookback: "
+        f"{breakout_lookback} hours"
     )
 
     print(
-        f"RSI minimum: "
-        f"{rsi_min}"
+        f"Trend EMA: "
+        f"{trend_period}"
     )
 
     print(
         f"Volume: "
-        f"{volume_mult}x"
+        f"{volume_mult}x average"
     )
 
     print(
@@ -1193,13 +1047,8 @@ def optimize(
     )
 
     print(
-        f"Trail starts: "
-        f"{trail_start} ATR"
-    )
-
-    print(
-        f"Trail distance: "
-        f"{trail_distance} ATR"
+        f"Maximum hold: "
+        f"{max_hold} hours"
     )
 
     print()
@@ -1215,13 +1064,13 @@ def optimize(
     )
 
     print()
-    print("=" * 76)
+    print("=" * 78)
 
     print(
-        "UNTOUCHED HOLDOUT"
+        "UNTOUCHED HOLDOUT — GROSS EDGE"
     )
 
-    print("=" * 76)
+    print("=" * 78)
 
     print_result(
         "HOLDOUT",
@@ -1229,27 +1078,18 @@ def optimize(
     )
 
     print(
-        f"Holdout money -> "
-        f"Gross ${final['gross']:+.2f} | "
-        f"Fees ${final['fees']:.2f} | "
-        f"Net ${final['net']:+.2f}"
-    )
-
-    print(
-        f"Holdout exits -> "
-        f"Targets {final['targets']} | "
-        f"Stops {final['stops']} | "
-        f"Trails {final['trails']}"
+        f"Gross P/L: "
+        f"${final['pnl']:+.2f}"
     )
 
     print(
         f"Average winner: "
-        f"${final['average_winner']:+.2f}"
+        f"${final['avg_winner']:+.2f}"
     )
 
     print(
         f"Average loser: "
-        f"${final['average_loser']:+.2f}"
+        f"${final['avg_loser']:+.2f}"
     )
 
     print(
@@ -1257,43 +1097,48 @@ def optimize(
         f"${final['expectancy']:+.2f}"
     )
 
-    if math.isinf(
-        final["profit_factor"]
-    ):
-        pf_text = "INF"
-    else:
-        pf_text = (
-            f"{final['profit_factor']:.2f}"
-        )
-
     print(
-        f"Profit factor: {pf_text}"
+        f"Profit factor: "
+        f"{pf_text(final['profit_factor'])}"
     )
 
-    print("=" * 76)
+    print(
+        f"Exits -> "
+        f"Targets {final['targets']} | "
+        f"Stops {final['stops']} | "
+        f"Time {final['time_exits']}"
+    )
 
+    print("=" * 78)
 
-def print_result(
-    label,
-    result,
-):
-    if math.isinf(
-        result["profit_factor"]
+    # ========================================================
+    # SIMPLE PASS / FAIL
+    # ========================================================
+
+    if (
+        final["trades"] >= 5
+        and final["pnl"] > 0
+        and final["profit_factor"] > 1.0
+        and final["expectancy"] > 0
     ):
-        pf_text = "INF"
-    else:
-        pf_text = (
-            f"{result['profit_factor']:.2f}"
+        print(
+            "V5 STAGE 1: GROSS EDGE DETECTED"
         )
 
-    print(
-        f"{label} -> "
-        f"{result['return_pct']:+.2f}% | "
-        f"{result['trades']} trades | "
-        f"{result['win_rate']:.1f}% win | "
-        f"DD {result['drawdown']:.2f}% | "
-        f"PF {pf_text}"
-    )
+        print(
+            "Next step: realistic "
+            "fees + slippage test."
+        )
+
+    else:
+        print(
+            "V5 STAGE 1: NO ROBUST "
+            "GROSS EDGE DETECTED"
+        )
+
+        print(
+            "Do NOT increase risk."
+        )
 
 
 # ============================================================
@@ -1301,12 +1146,13 @@ def print_result(
 # ============================================================
 
 def main():
+
     print(
-        "BTC/ETH STRATEGY V4"
+        "BTC/ETH STRATEGY V5"
     )
 
     print(
-        "1-HOUR SWING BACKTEST"
+        "BREAKOUT / VOLATILITY EXPANSION"
     )
 
     print(
@@ -1319,9 +1165,18 @@ def main():
     )
 
     print(
+        "1-HOUR EXECUTION"
+    )
+
+    print(
         "60% TRAIN / "
         "20% VALIDATION / "
         "20% UNTOUCHED HOLDOUT"
+    )
+
+    print(
+        "STAGE 1 = ZERO-FEE "
+        "GROSS EDGE TEST"
     )
 
     print(
@@ -1329,31 +1184,17 @@ def main():
         f"{RISK_PER_TRADE * 100:.1f}%"
     )
 
-    print(
-        "No early EMA trend exits."
-    )
-
-    print(
-        "ATR stop + target + trailing stop."
-    )
-
     for product_name in config.PRODUCTS:
+
         try:
             candles = get_history(
                 product_name
             )
 
-            for (
-                fee_name,
-                fee_rate,
-            ) in FEE_MODELS.items():
-
-                optimize(
-                    product_name,
-                    candles,
-                    fee_name,
-                    fee_rate,
-                )
+            optimize(
+                product_name,
+                candles,
+            )
 
         except Exception as exc:
             print(
