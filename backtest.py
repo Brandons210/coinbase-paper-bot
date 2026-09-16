@@ -83,9 +83,11 @@ def get_history(client, product, days=DAYS_TO_TEST):
     start_time = end_time - timedelta(days=days)
 
     all_candles = {}
-    batch_seconds = (CANDLES_PER_REQUEST - 1) * GRANULARITY_SECONDS
     cursor = start_time
     batch_number = 0
+
+    # Coinbase allows a maximum window of 300 five-minute candles.
+    batch_seconds = 300 * GRANULARITY_SECONDS
 
     print(f"Downloading about {days} days of {product} candles...")
 
@@ -95,19 +97,27 @@ def get_history(client, product, days=DAYS_TO_TEST):
             end_time
         )
 
+        # Use positional start/end values because some SDK versions
+        # mishandle these values when sent as keyword arguments.
         response = client.get_public_candles(
-            product_id=product,
-            start=str(int(cursor.timestamp())),
-            end=str(int(chunk_end.timestamp())),
-            granularity="FIVE_MINUTE",
-            limit=CANDLES_PER_REQUEST,
+            product,
+            str(int(cursor.timestamp())),
+            str(int(chunk_end.timestamp())),
+            "FIVE_MINUTE",
+            300,
         )
 
         batch_number += 1
-        print(
-            f"  Batch {batch_number}: "
-            f"{len(response.candles)} candles"
-        )
+
+        if response.candles:
+            first_time = min(int(c.start) for c in response.candles)
+            last_time = max(int(c.start) for c in response.candles)
+
+            print(
+                f"Batch {batch_number}: {len(response.candles)} candles "
+                f"{datetime.fromtimestamp(first_time, timezone.utc)} -> "
+                f"{datetime.fromtimestamp(last_time, timezone.utc)}"
+            )
 
         for c in response.candles:
             candle = {
@@ -118,15 +128,17 @@ def get_history(client, product, days=DAYS_TO_TEST):
                 "close": float(c.close),
                 "volume": float(c.volume),
             }
+
             all_candles[candle["time"]] = candle
 
-        cursor = chunk_end + timedelta(seconds=GRANULARITY_SECONDS)
-        time.sleep(0.20)
+        cursor = chunk_end
+        time.sleep(0.15)
 
     candles = list(all_candles.values())
     candles.sort(key=lambda x: x["time"])
 
     print(f"Total unique candles downloaded: {len(candles)}")
+
     return candles
 
 
